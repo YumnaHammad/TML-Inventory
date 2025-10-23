@@ -29,19 +29,14 @@ const PORT = process.env.PORT || 5000;
 
 // CORS - Smart configuration for both local and production
 const allowedOrigins = [
-  // Production (Vercel)
-  'https://inventory-system-amber-beta.vercel.app',
+  
   // Local development
   'http://localhost:3000', 
   'http://localhost:3001', 
-  'http://localhost:5173',  // Vite default port
   'http://localhost:8080',
   'http://127.0.0.1:3000',
   'http://127.0.0.1:3001',
-  'http://127.0.0.1:5173',  // Vite default port
-  'http://127.0.0.1:8080',
-  // Your server IP
-  'http://159.198.32.23:5173'
+  'http://127.0.0.1:8080'
 ];
 
 app.use(cors({

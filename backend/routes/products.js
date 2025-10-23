@@ -8,7 +8,7 @@ const {
   generateSKU
 } = require('../controllers/productController');
 const { authenticateToken } = require('../middleware/auth');
-const { requireAdmin, requireManagerOrAdmin } = require('../middleware/auth');
+const { requireAdmin } = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -18,7 +18,7 @@ router.get('/:id', getProductById);
 
 // Admin-only routes - only admins can create, update, delete products
 router.post('/generate-sku', authenticateToken, requireAdmin, generateSKU);
-router.post('/', authenticateToken, requireManagerOrAdmin, createProduct);
+router.post('/', authenticateToken, requireAdmin, createProduct);
 router.put('/:id', authenticateToken, requireAdmin, updateProduct);
 router.delete('/:id', authenticateToken, requireAdmin, deleteProduct);
 
