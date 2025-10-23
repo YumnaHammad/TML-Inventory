@@ -7,9 +7,9 @@ const getBaseURL = () => {
   if (window.location.hostname.includes('vercel.app')) {
     return 'https://backendsystem-gamma.vercel.app/api';
   }
-  // If we're on localhost (development), use local backend
+  // If we're on localhost (development), use your backend server
   if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-    return '/api';
+    return 'http://159.198.32.23:5000/api';
   }
   // Fallback to environment variable or Vercel backend
   return import.meta.env.VITE_API_URL || 'https://backendsystem-gamma.vercel.app/api';
