@@ -1,7 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
-require('dotenv').config();
+// Load environment variables
+require('dotenv').config({ path: './env' });
 
 // Import route files
 const authRoutes = require('./routes/auth');
@@ -29,6 +30,8 @@ const PORT = process.env.PORT || 5000;
 
 // CORS - Smart configuration for both local and production
 const allowedOrigins = [
+  // Environment variable for frontend URL
+  process.env.FRONTEND_URL,
   
   // Local development
   'http://localhost:3000', 
@@ -37,7 +40,7 @@ const allowedOrigins = [
   'http://127.0.0.1:3000',
   'http://127.0.0.1:3001',
   'http://127.0.0.1:8080'
-];
+].filter(Boolean); // Remove undefined values
 
 app.use(cors({
   origin: function (origin, callback) {
@@ -113,8 +116,15 @@ app.use('/api/customers', customerRoutes);
 // MongoDB Connection
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://inventory:leader12@cluster0.earrfsb.mongodb.net/inventory_system?retryWrites=true&w=majority';
 
-// Connect to MongoDB with better error handling
+// Database connection middleware for serverless functions
+let isConnected = false;
+
 async function connectToMongoDB() {
+  if (isConnected) {
+    console.log('✅ MongoDB already connected');
+    return;
+  }
+
   try {
     await mongoose.connect(MONGODB_URI, {
       serverSelectionTimeoutMS: 10000,
@@ -122,27 +132,45 @@ async function connectToMongoDB() {
       maxPoolSize: 10,
       serverApi: { version: '1', strict: false }
     });
+    isConnected = true;
     console.log('✅ Connected to MongoDB');
   } catch (error) {
     console.error('❌ MongoDB Error:', error.message);
-    console.log('🔄 Retrying connection in 10 seconds...');
-    setTimeout(connectToMongoDB, 10000);
+    isConnected = false;
+    throw error;
   }
 }
 
-connectToMongoDB();
+// Database connection middleware
+app.use(async (req, res, next) => {
+  try {
+    if (!isConnected) {
+      await connectToMongoDB();
+    }
+    next();
+  } catch (error) {
+    console.error('Database connection failed:', error);
+    res.status(500).json({ 
+      error: 'Database connection failed', 
+      message: 'Unable to connect to database' 
+    });
+  }
+});
 
 // MongoDB connection event handlers
 mongoose.connection.on('connected', () => {
   console.log('✅ MongoDB connected successfully');
+  isConnected = true;
 });
 
 mongoose.connection.on('error', (err) => {
   console.error('❌ MongoDB connection error:', err);
+  isConnected = false;
 });
 
 mongoose.connection.on('disconnected', () => {
   console.log('⚠️ MongoDB disconnected');
+  isConnected = false;
 });
 
 // Health check
@@ -150,12 +178,17 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', message: 'Server running' });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`🚀 Server running at http://localhost:${PORT}`);
-  console.log(`📊 API endpoints available at http://localhost:${PORT}/api`);
-  console.log(`🔧 Health check at http://localhost:${PORT}/api/health`);
-});
+// Start server (only for local development)
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`🚀 Server running at http://localhost:${PORT}`);
+    console.log(`📊 API endpoints available at http://localhost:${PORT}/api`);
+    console.log(`🔧 Health check at http://localhost:${PORT}/api/health`);
+  });
+}
+
+// Export app for Vercel serverless functions
+module.exports = app;
 
 // Handle uncaught exceptions
 process.on('uncaughtException', (error) => {
