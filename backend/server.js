@@ -131,14 +131,16 @@ async function connectToMongoDB() {
 
   try {
     await mongoose.connect(MONGODB_URI, {
-      serverSelectionTimeoutMS: 30000,  // Increased from 10s to 30s
-      socketTimeoutMS: 60000,          // Increased from 45s to 60s
-      connectTimeoutMS: 30000,         // Added connection timeout
+      serverSelectionTimeoutMS: 0,      // No timeout - wait forever
+      socketTimeoutMS: 0,               // No socket timeout
+      connectTimeoutMS: 0,              // No connection timeout
       maxPoolSize: 10,
-      maxIdleTimeMS: 30000,            // Added idle timeout
+      maxIdleTimeMS: 0,                 // No idle timeout
       serverApi: { version: '1', strict: false },
       bufferCommands: false,            // Disable mongoose buffering
-      bufferMaxEntries: 0               // Disable mongoose buffering
+      bufferMaxEntries: 0,              // Disable mongoose buffering
+      heartbeatFrequencyMS: 0,           // Disable heartbeat timeout
+      serverSelectionRetryDelayMS: 0   // No retry delay
     });
     isConnected = true;
     console.log('✅ Connected to MongoDB');
@@ -150,16 +152,17 @@ async function connectToMongoDB() {
   }
 }
 
-// Database connection middleware
+// Database connection middleware - No timeout, always try to connect
 app.use(async (req, res, next) => {
   try {
     if (!isConnected) {
+      console.log('🔄 Attempting database connection...');
       await connectToMongoDB();
     }
     next();
   } catch (error) {
     console.error('Database connection failed:', error);
-    // Don't block requests, just log the error and continue
+    // Continue without database - don't block API calls
     console.log('⚠️ Proceeding without database connection');
     next();
   }
@@ -174,12 +177,37 @@ mongoose.connection.on('connected', () => {
 mongoose.connection.on('error', (err) => {
   console.error('❌ MongoDB connection error:', err);
   isConnected = false;
+  // Try to reconnect immediately
+  setTimeout(() => {
+    console.log('🔄 Attempting to reconnect to MongoDB...');
+    connectToMongoDB();
+  }, 1000);
 });
 
 mongoose.connection.on('disconnected', () => {
   console.log('⚠️ MongoDB disconnected');
   isConnected = false;
+  // Try to reconnect immediately
+  setTimeout(() => {
+    console.log('🔄 Attempting to reconnect to MongoDB...');
+    connectToMongoDB();
+  }, 1000);
 });
+
+// Keep connection alive - ping every 30 seconds
+setInterval(() => {
+  if (isConnected) {
+    mongoose.connection.db.admin().ping((err, result) => {
+      if (err) {
+        console.log('⚠️ MongoDB ping failed, reconnecting...');
+        isConnected = false;
+        connectToMongoDB();
+      } else {
+        console.log('✅ MongoDB connection alive');
+      }
+    });
+  }
+}, 30000);
 
 // Health check
 app.get('/api/health', (req, res) => {
