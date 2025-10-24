@@ -34,7 +34,7 @@ services:
     working_dir: /app
     restart: unless-stopped
     environment:
-      VITE_API_URL: https://tml-backend.vercel.app/api
+      VITE_API_URL: http://localhost:5000/api
     depends_on:
       - backend
     ports:
