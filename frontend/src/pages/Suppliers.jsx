@@ -8,11 +8,18 @@ import {
   AlertTriangle, Mail, Phone, MapPin, Globe, Crown, Shield, User,
   ArrowUp, ArrowDown, MoreVertical, Download, FileSpreadsheet, FileText,
   BarChart3, PieChart, LineChart, Target, Zap, Activity, X,
-  ShoppingCart, Package
+  ShoppingCart, Package, Settings
 } from 'lucide-react';
 import api from '../services/api';
 import toast from 'react-hot-toast';
 import ExportButton from '../components/ExportButton';
+import { 
+  loadFormatSettings, 
+  applyFormatSettings, 
+  getVisibleColumns, 
+  getColumnConfig,
+  generateExportData 
+} from '../utils/supplierFormatUtils';
 
 const Suppliers = () => {
   const { user } = useAuth();
@@ -38,6 +45,7 @@ const Suppliers = () => {
   const [showAnalyticsModal, setShowAnalyticsModal] = useState(false);
   const [selectedSupplier, setSelectedSupplier] = useState(null);
   const [spendingAnalytics, setSpendingAnalytics] = useState(null);
+  const [formatSettings, setFormatSettings] = useState(null);
   const [formData, setFormData] = useState({
     name: '',
     companyName: '',
@@ -165,6 +173,9 @@ const Suppliers = () => {
 
   useEffect(() => {
     fetchSuppliers();
+    // Load format settings
+    const settings = loadFormatSettings();
+    setFormatSettings(settings);
   }, []);
 
   // Handle sorting
@@ -303,7 +314,13 @@ const Suppliers = () => {
   // Export suppliers
   const handleExportSuppliers = async (format = 'excel') => {
     const { exportSuppliers } = await import('../utils/exportUtils');
-    return exportSuppliers(filteredSuppliers, format);
+    const exportData = formatSettings ? generateExportData(filteredSuppliers, formatSettings) : filteredSuppliers;
+    return exportSuppliers(exportData, format);
+  };
+
+  // Handle format settings change
+  const handleFormatChange = (newSettings) => {
+    setFormatSettings(newSettings);
   };
 
   if (loading) {
@@ -357,19 +374,19 @@ const Suppliers = () => {
       </div>
 
       {/* Statistics Cards */}
-      <div className={`grid grid-cols-1 md:grid-cols-${user?.role === 'admin' ? '5' : '4'} gap-6`}>
+      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-6">
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
-          className="card p-6"
+          className="card p-4"
         >
           <div className="flex items-center">
-            <div className="p-3 bg-blue-500 rounded-lg mr-4">
-              <Building2 className="h-6 w-6 text-white" />
+            <div className="p-2 bg-blue-500 rounded-lg mr-3">
+              <Building2 className="h-5 w-5 text-white" />
             </div>
             <div>
-              <p className="text-sm font-medium text-gray-600">Total Suppliers</p>
-              <p className="text-2xl font-bold text-gray-900">{supplierStats.totalSuppliers}</p>
+              <p className="text-xs font-medium text-gray-600">Total Suppliers</p>
+              <p className="text-xl font-bold text-gray-900">{supplierStats.totalSuppliers}</p>
             </div>
           </div>
         </motion.div>
@@ -378,15 +395,15 @@ const Suppliers = () => {
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.1 }}
-          className="card p-6"
+          className="card p-4"
         >
           <div className="flex items-center">
-            <div className="p-3 bg-green-500 rounded-lg mr-4">
-              <CheckCircle className="h-6 w-6 text-white" />
+            <div className="p-2 bg-green-500 rounded-lg mr-3">
+              <CheckCircle className="h-5 w-5 text-white" />
             </div>
             <div>
-              <p className="text-sm font-medium text-gray-600">Active</p>
-              <p className="text-2xl font-bold text-gray-900">{supplierStats.activeSuppliers}</p>
+              <p className="text-xs font-medium text-gray-600">Active</p>
+              <p className="text-xl font-bold text-gray-900">{supplierStats.activeSuppliers}</p>
             </div>
           </div>
         </motion.div>
@@ -395,15 +412,15 @@ const Suppliers = () => {
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.2 }}
-          className="card p-6"
+          className="card p-4"
         >
           <div className="flex items-center">
-            <div className="p-3 bg-yellow-500 rounded-lg mr-4">
-              <Star className="h-6 w-6 text-white" />
+            <div className="p-2 bg-yellow-500 rounded-lg mr-3">
+              <Star className="h-5 w-5 text-white" />
             </div>
             <div>
-              <p className="text-sm font-medium text-gray-600">Preferred</p>
-              <p className="text-2xl font-bold text-gray-900">{supplierStats.preferredSuppliers}</p>
+              <p className="text-xs font-medium text-gray-600">Preferred</p>
+              <p className="text-xl font-bold text-gray-900">{supplierStats.preferredSuppliers}</p>
             </div>
           </div>
         </motion.div>
@@ -413,15 +430,15 @@ const Suppliers = () => {
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: 0.3 }}
-            className="card p-6"
+            className="card p-4"
           >
             <div className="flex items-center">
-              <div className="p-3 bg-purple-500 rounded-lg mr-4">
-                <DollarSign className="h-6 w-6 text-white" />
+              <div className="p-2 bg-purple-500 rounded-lg mr-3">
+                <DollarSign className="h-5 w-5 text-white" />
               </div>
               <div>
-                <p className="text-sm font-medium text-gray-600">Total Spent</p>
-                <p className="text-2xl font-bold text-gray-900">PKR {supplierStats.totalSpent?.toLocaleString() || '0'}</p>
+                <p className="text-xs font-medium text-gray-600">Total Spent</p>
+                <p className="text-xl font-bold text-gray-900">PKR {supplierStats.totalSpent?.toLocaleString() || '0'}</p>
               </div>
             </div>
           </motion.div>
@@ -431,15 +448,15 @@ const Suppliers = () => {
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.4 }}
-          className="card p-6"
+          className="card p-4"
         >
           <div className="flex items-center">
-            <div className="p-3 bg-orange-500 rounded-lg mr-4">
-              <TrendingUp className="h-6 w-6 text-white" />
+            <div className="p-2 bg-orange-500 rounded-lg mr-3">
+              <TrendingUp className="h-5 w-5 text-white" />
             </div>
             <div>
-              <p className="text-sm font-medium text-gray-600">Avg Rating</p>
-              <p className="text-2xl font-bold text-gray-900">{supplierStats.averageRating?.toFixed(1) || '0.0'}</p>
+              <p className="text-xs font-medium text-gray-600">Avg Rating</p>
+              <p className="text-xl font-bold text-gray-900">{supplierStats.averageRating?.toFixed(1) || '0.0'}</p>
             </div>
           </div>
         </motion.div>
@@ -1370,6 +1387,7 @@ const Suppliers = () => {
           </motion.div>
         )}
       </AnimatePresence>
+
 
     </div>
   );
