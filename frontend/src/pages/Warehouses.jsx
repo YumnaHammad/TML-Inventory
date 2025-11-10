@@ -44,15 +44,79 @@ const Warehouses = () => {
   const [showConfirmModal, setShowConfirmModal] = useState(false);
   const [warehouseToDeleteConfirm, setWarehouseToDeleteConfirm] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
+  const [inventorySearch, setInventorySearch] = useState('');
   const location = useLocation();
   const navigate = useNavigate();
   const { user, hasAnyRole } = useAuth();
 
-  useEffect(() => {
-    if (location.pathname === '/warehouses') {
-      fetchWarehouses();
+  const normalizeKey = (value) => {
+    if (!value) return '';
+    return String(value).toLowerCase().trim().replace(/\s+/g, ' ');
+  };
+
+  const findProductById = (productId) => {
+    if (!productId) return null;
+    return products.find(
+      (product) => product._id && product._id.toString() === productId.toString()
+    );
+  };
+
+  const getCanonicalProductName = (stockItem) => {
+    const productId = stockItem.productId?._id || stockItem.productId;
+    const productRecord = findProductById(productId);
+    return productRecord?.name || stockItem.productId?.name || 'Unknown Product';
+  };
+
+  const getCanonicalVariantName = (stockItem) => {
+    const productId = stockItem.productId?._id || stockItem.productId;
+    const productRecord = findProductById(productId);
+    const variantId = stockItem.variantId || 'no-variant';
+    let variantName = stockItem.variantDetails?.name || stockItem.variantName || 'no-variant';
+    const normalizedFallbackName = normalizeKey(variantName);
+
+    if (
+      productRecord &&
+      productRecord.hasVariants &&
+      Array.isArray(productRecord.variants) &&
+      variantId !== 'no-variant'
+    ) {
+      const matchedVariant = productRecord.variants.find(
+        (variant) => {
+          const candidateId = variant._id || variant.sku;
+          return candidateId && candidateId.toString() === variantId.toString();
+        }
+      );
+      if (matchedVariant?.name) {
+        return matchedVariant.name;
+      }
     }
-    fetchProducts();
+
+    if (
+      productRecord &&
+      productRecord.hasVariants &&
+      Array.isArray(productRecord.variants) &&
+      normalizedFallbackName && normalizedFallbackName !== 'no-variant'
+    ) {
+      const matchedVariantByName = productRecord.variants.find(
+        (variant) => normalizeKey(variant.name) === normalizedFallbackName
+      );
+      if (matchedVariantByName?.name) {
+        return matchedVariantByName.name;
+      }
+    }
+
+    return variantName;
+  };
+
+  useEffect(() => {
+    const loadData = async () => {
+      await fetchProducts();
+      if (location.pathname === '/warehouses') {
+        await fetchWarehouses();
+      }
+    };
+
+    loadData();
   }, [location.pathname]);
 
   // Ensure products is always an array to prevent map errors
@@ -200,6 +264,12 @@ const Warehouses = () => {
   };
 
   const confirmDeleteWarehouse = (warehouse) => {
+    // Only admin can delete warehouses
+    if (!user || user.role !== 'admin') {
+      toast.error('Only admins can delete warehouses');
+      return;
+    }
+    
     console.log('🗑️ DELETE BUTTON CLICKED:', warehouse.name);
     setWarehouseToDeleteConfirm(warehouse);
     setShowConfirmModal(true);
@@ -207,6 +277,14 @@ const Warehouses = () => {
 
   const handleConfirmDelete = async () => {
     if (!warehouseToDeleteConfirm || deleting) return;
+
+    // Only admin can delete warehouses
+    if (!user || user.role !== 'admin') {
+      toast.error('Only admins can delete warehouses');
+      setShowConfirmModal(false);
+      setWarehouseToDeleteConfirm(null);
+      return;
+    }
 
     setDeleting(true);
     setShowConfirmModal(false);
@@ -253,8 +331,9 @@ const Warehouses = () => {
       return;
     }
     
-    if (!hasAnyRole(['admin', 'manager'])) {
-      toast.error('Only admins and managers can delete warehouses');
+    // Only admin can delete warehouses
+    if (user.role !== 'admin') {
+      toast.error('Only admins can delete warehouses');
       return;
     }
     
@@ -334,9 +413,11 @@ const Warehouses = () => {
       const mergedStock = {};
       
       selectedWarehouse.currentStock.forEach(stockItem => {
-        const productName = stockItem.productId?.name || 'Unknown Product';
-        const variantName = stockItem.variantDetails?.name || stockItem.variantName || 'no-variant';
-        const key = `${productName}-${variantName}`;
+        const canonicalProductName = getCanonicalProductName(stockItem);
+        const canonicalVariantName = getCanonicalVariantName(stockItem);
+        const productNameKey = normalizeKey(canonicalProductName);
+        const variantNameKey = normalizeKey(canonicalVariantName);
+        const key = `${productNameKey}-${variantNameKey}`;
         
         if (!mergedStock[key]) {
           mergedStock[key] = {
@@ -347,8 +428,9 @@ const Warehouses = () => {
             confirmedDeliveredQuantity: 0,
             expectedReturns: 0,
             returnedQuantity: 0,
-            displayProductName: productName,
-            displayVariantName: variantName,
+            // Store the display names for consistent display
+            displayProductName: canonicalProductName,
+            displayVariantName: canonicalVariantName,
             displaySKU: stockItem.variantDetails?.sku || stockItem.productId?.sku || 'N/A'
           };
         }
@@ -402,7 +484,8 @@ const Warehouses = () => {
     }
   };
 
-  if (selectedWarehouse) {
+  // For agents, only show products list, not warehouse details
+  if (selectedWarehouse && user?.role !== 'agent') {
     return (
       <div className="space-y-6">
         {/* Header */}
@@ -525,6 +608,13 @@ const Warehouses = () => {
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-lg font-semibold text-gray-900">Product Inventory</h3>
             <div className="flex items-center gap-3">
+              <input
+                type="text"
+                value={inventorySearch}
+                onChange={(e) => setInventorySearch(e.target.value)}
+                placeholder="Search products..."
+                className="input-field w-64"
+              />
               <button
                 onClick={() => handleExportInventory()}
                 className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg flex items-center text-sm transition-colors duration-200"
@@ -663,7 +753,18 @@ const Warehouses = () => {
                       mergedStock[key].returnedQuantity += (stockItem.returnedQuantity || 0);
                     });
                     
-                    return Object.values(mergedStock).map((stockItem, index) => {
+                    const filteredRows = Object.values(mergedStock).filter((s) => {
+                      if (!inventorySearch.trim()) return true;
+                      const displayName = s.displayVariantName !== 'no-variant'
+                        ? `${s.displayProductName} / ${s.displayVariantName}`
+                        : s.displayProductName;
+                      return (
+                        displayName.toLowerCase().includes(inventorySearch.toLowerCase()) ||
+                        (s.displaySKU || '').toLowerCase().includes(inventorySearch.toLowerCase())
+                      );
+                    });
+
+                    return filteredRows.map((stockItem, index) => {
                       // Use the stored display names for consistent display
                       const displayName = stockItem.displayVariantName !== 'no-variant' 
                         ? `${stockItem.displayProductName} / ${stockItem.displayVariantName}`
@@ -1217,29 +1318,34 @@ const Warehouses = () => {
                 Add Stock
               </button>
               <div className="flex space-x-2">
-                <button 
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    fetchWarehouseDetails(warehouse._id);
-                  }}
-                  className="text-blue-600 hover:text-blue-800 p-1"
-                  title="View Details"
-                >
-                  <Eye className="h-4 w-4" />
-                </button>
-                <button 
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    confirmDeleteWarehouse(warehouse);
-                  }}
-                  className="text-red-600 hover:text-red-800 p-1 bg-red-50 hover:bg-red-100 rounded transition-colors"
-                  title="Delete Warehouse"
-                  type="button"
-                  disabled={deleting}
-                >
-                  <Trash2 className="h-4 w-4" />
-                </button>
+                {/* View Details button - Hidden for agents */}
+                {user?.role !== 'agent' && (
+                  <button 
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      fetchWarehouseDetails(warehouse._id);
+                    }}
+                    className="text-blue-600 hover:text-blue-800 p-1"
+                    title="View Details"
+                  >
+                    <Eye className="h-4 w-4" />
+                  </button>
+                )}
+                {user?.role === 'admin' && (
+                  <button 
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      confirmDeleteWarehouse(warehouse);
+                    }}
+                    className="text-red-600 hover:text-red-800 p-1 bg-red-50 hover:bg-red-100 rounded transition-colors"
+                    title="Delete Warehouse"
+                    type="button"
+                    disabled={deleting}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                )}
             </div>
           </div>
         </motion.div>

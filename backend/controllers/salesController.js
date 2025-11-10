@@ -1,10 +1,50 @@
 const { SalesOrder, Product, Customer, Warehouse, StockMovement, SalesShipment } = require('../models');
 const { createAuditLog } = require('../middleware/audit');
 
+const normalizeId = (value) => {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number') return value.toString();
+
+  let current = value;
+  const visited = new Set();
+  let depth = 0;
+  const MAX_DEPTH = 6;
+
+  while (current && typeof current === 'object' && depth < MAX_DEPTH && !visited.has(current)) {
+    visited.add(current);
+
+    if (typeof current === 'string') return current;
+    if (typeof current === 'number') return current.toString();
+
+    if (current._id) {
+      current = current._id;
+      depth += 1;
+      continue;
+    }
+
+    if (current.id) {
+      const idValue = current.id;
+      if (typeof idValue === 'string') return idValue;
+      current = idValue;
+      depth += 1;
+      continue;
+    }
+
+    break;
+  }
+
+  if (current && typeof current === 'object' && typeof current.toString === 'function' && current.toString !== Object.prototype.toString) {
+    return current.toString();
+  }
+
+  return String(current);
+};
+
 // Create a new sales order
 const createSalesOrder = async (req, res) => {
   try {
-    const { customerInfo, items, deliveryAddress, expectedDeliveryDate, notes } = req.body;
+    const { customerInfo, items, deliveryAddress, expectedDeliveryDate, notes, agentName, timestamp } = req.body;
 
     // Validate required fields
     if (!customerInfo?.address?.city) {
@@ -37,27 +77,51 @@ const createSalesOrder = async (req, res) => {
         return res.status(404).json({ error: `Product with ID ${item.productId} not found` });
       }
 
+      const requestedProductId = normalizeId(item.productId);
+      const requestedVariantId = normalizeId(item.variantId || '');
+      const requestedVariantName = item.variantName || null;
+
       // Get variant info if provided
-      let variantName = null;
-      if (item.variantId && product.hasVariants && product.variants) {
-        const variant = product.variants.find(v => (v._id?.toString() === item.variantId || v.sku === item.variantId));
+      let variantName = requestedVariantName;
+      if (!variantName && requestedVariantId && product.hasVariants && Array.isArray(product.variants)) {
+        const variant = product.variants.find(v => {
+          const variantId = normalizeId(v._id);
+          const variantSku = normalizeId(v.sku);
+          return variantId === requestedVariantId || (variantSku && variantSku === requestedVariantId);
+        });
         if (variant) {
           variantName = variant.name;
         }
       }
+
+      const normalizedVariantName = (variantName || '').toString().toLowerCase().trim();
 
       // Check stock availability across all warehouses (MATCH BY PRODUCT + VARIANT)
       const warehouses = await Warehouse.find({ isActive: true });
       let totalAvailableStock = 0;
       
       for (const warehouse of warehouses) {
-      const stockItem = warehouse.currentStock.find(stock => 
-          stock.productId.toString() === item.productId &&
-          (stock.variantId || null) === (item.variantId || null)
-      );
+        const stockItem = warehouse.currentStock.find(stock => {
+          const stockProductId = normalizeId(stock.productId?._id || stock.productId);
+          const stockVariantId = normalizeId(stock.variantId || stock.variantDetails?._id || stock.variantDetails?.sku || '');
+          const stockVariantName = (stock.variantDetails?.name || stock.variantName || '').toString().toLowerCase().trim();
+
+          const productMatches = stockProductId === requestedProductId;
+          const variantMatches = requestedVariantId
+            ? (stockVariantId === requestedVariantId || (
+                normalizedVariantName && stockVariantName && stockVariantName === normalizedVariantName
+              ))
+            : (!stockVariantId || (
+                normalizedVariantName && stockVariantName && stockVariantName === normalizedVariantName
+              ));
+
+          return productMatches && variantMatches;
+        });
         if (stockItem) {
           const reserved = stockItem.reservedQuantity || 0;
-          const available = (stockItem.quantity || 0) - reserved;
+          const delivered = stockItem.deliveredQuantity || 0;
+          const confirmedDelivered = stockItem.confirmedDeliveredQuantity || 0;
+          const available = (stockItem.quantity || 0) - reserved - delivered - confirmedDelivered;
           totalAvailableStock += Math.max(0, available);
         }
       }
@@ -89,23 +153,103 @@ const createSalesOrder = async (req, res) => {
       });
     }
 
-    // Generate order number
-    const count = await SalesOrder.countDocuments();
-    const orderNumber = `SO-${String(count + 1).padStart(4, '0')}`;
+    // Generate unique order number using atomic operation with retry
+    let salesOrder;
+    let orderNumber;
+    
+    // Strategy: Find max order number, then use findOneAndUpdate with upsert to ensure atomicity
+    // But since we can't use that for order number generation, we'll use a simple retry loop
+    let attempts = 0;
+    const maxAttempts = 100;
+    
+    // Get the maximum order number using aggregation
+    let startNumber = 0;
+    try {
+      const result = await SalesOrder.aggregate([
+        { 
+          $project: { 
+            orderNum: { 
+              $toInt: { 
+                $arrayElemAt: [
+                  { $split: [{ $ifNull: ["$orderNumber", "SO-0000"] }, "-"] },
+                  1
+                ]
+              }
+            }
+          }
+        },
+        { $group: { _id: null, maxOrder: { $max: "$orderNum" } } }
+      ]);
+      
+      if (result && result.length > 0 && result[0].maxOrder !== null && result[0].maxOrder !== undefined) {
+        startNumber = result[0].maxOrder;
+      }
+    } catch (aggError) {
+      // Fallback: use findOne with sort
+      console.warn('Aggregation failed, using fallback method:', aggError.message);
+      const lastOrder = await SalesOrder.findOne({}, { orderNumber: 1 }).sort({ orderNumber: -1 });
+      if (lastOrder && lastOrder.orderNumber) {
+        const match = lastOrder.orderNumber.match(/SO-(\d+)/);
+        if (match) {
+          startNumber = parseInt(match[1]) || 0;
+        }
+      }
+    }
+    
+    let candidateNumber = startNumber + 1;
+    console.log(`Starting order number generation from: ${startNumber}, next candidate: ${candidateNumber}`);
+    
+    // Retry loop with database checks
+    while (attempts < maxAttempts) {
+      orderNumber = `SO-${String(candidateNumber).padStart(4, '0')}`;
+      
+      try {
+        // Check if exists
+        const exists = await SalesOrder.findOne({ orderNumber: orderNumber });
+        if (exists) {
+          candidateNumber++;
+          attempts++;
+          continue;
+        }
+        
+        // Try to create with this order number
+        salesOrder = new SalesOrder({
+          orderNumber,
+          customerInfo,
+          items: validatedItems,
+          totalAmount,
+          deliveryAddress,
+          expectedDeliveryDate,
+          notes,
+          agentName: agentName || null,
+          timestamp: timestamp ? new Date(timestamp) : new Date(),
+          createdBy: userId
+        });
 
-    // Create sales order
-    const salesOrder = new SalesOrder({
-      orderNumber,
-      customerInfo,
-      items: validatedItems,
-      totalAmount,
-      deliveryAddress,
-      expectedDeliveryDate,
-      notes,
-      createdBy: userId
-    });
-
-    await salesOrder.save();
+        await salesOrder.save();
+        // Success!
+        break;
+        
+      } catch (saveError) {
+        // Handle duplicate key error
+        if (saveError.code === 11000) {
+          candidateNumber++;
+          attempts++;
+          if (attempts >= maxAttempts) {
+            throw new Error('Failed to generate unique order number after 100 attempts. Please try again.');
+          }
+          // Small delay
+          await new Promise(resolve => setTimeout(resolve, 10));
+          continue;
+        }
+        // Other errors should be thrown
+        throw saveError;
+      }
+    }
+    
+    if (!salesOrder) {
+      throw new Error('Failed to create sales order: Could not generate unique order number.');
+    }
     
     // Reservation will occur on dispatch; keep empty array for response compatibility
     const reservedStock = [];
@@ -138,20 +282,38 @@ const createSalesOrder = async (req, res) => {
     });
 
   } catch (error) {
+    // Log full error for debugging
+    console.error('Error creating sales order:', error);
+    console.error('Error stack:', error.stack);
+    console.error('Error code:', error.code);
+    console.error('Error keyPattern:', error.keyPattern);
+    
     // Provide detailed error message to help debugging
     const errorMessage = error.message || 'Internal server error';
-    res.status(500).json({ 
+    const errorDetails = {
       error: 'Failed to create sales order',
       details: errorMessage,
-      suggestion: 'Please check if products have stock in warehouse and try again'
-    });
+      code: error.code,
+      keyPattern: error.keyPattern
+    };
+    
+    // If it's a duplicate key error, provide specific message
+    if (error.code === 11000) {
+      errorDetails.error = 'Duplicate order number detected';
+      errorDetails.details = `Order number already exists. ${errorMessage}`;
+      errorDetails.suggestion = 'Please try again - the system will generate a new number automatically';
+    } else {
+      errorDetails.suggestion = 'Please check your data and try again. If the problem persists, contact support.';
+    }
+    
+    res.status(500).json(errorDetails);
   }
 };
 
 // Get all sales orders
 const getAllSalesOrders = async (req, res) => {
   try {
-    const { page = 1, limit = 10, status, startDate, endDate, isActive } = req.query;
+    const { page = 1, limit = 10, status, startDate, endDate, isActive, search } = req.query;
     
     // Show all sales orders by default, allow filtering by isActive
     let query = {};
@@ -161,24 +323,75 @@ const getAllSalesOrders = async (req, res) => {
     
     if (status) query.status = status;
     if (startDate || endDate) {
-      query.orderDate = {};
-      if (startDate) query.orderDate.$gte = new Date(startDate);
-      if (endDate) query.orderDate.$lte = new Date(endDate);
+      // Use orderDate, timestamp, or createdAt for date filtering
+      query.$or = [];
+      if (startDate && endDate) {
+        const start = new Date(startDate);
+        const end = new Date(endDate);
+        query.$or = [
+          { orderDate: { $gte: start, $lte: end } },
+          { timestamp: { $gte: start, $lte: end } },
+          { createdAt: { $gte: start, $lte: end } }
+        ];
+      } else if (startDate) {
+        const start = new Date(startDate);
+        query.$or = [
+          { orderDate: { $gte: start } },
+          { timestamp: { $gte: start } },
+          { createdAt: { $gte: start } }
+        ];
+      } else if (endDate) {
+        const end = new Date(endDate);
+        query.$or = [
+          { orderDate: { $lte: end } },
+          { timestamp: { $lte: end } },
+          { createdAt: { $lte: end } }
+        ];
+      }
     }
+
+    // Add search functionality for phone number, CN number, and agent name
+    const isSearching = search && search.trim();
+    if (isSearching) {
+      const searchRegex = new RegExp(search.trim(), 'i'); // Case-insensitive search
+      query.$or = [
+        { 'customerInfo.phone': searchRegex },
+        { 'customerInfo.cnNumber': searchRegex },
+        { 'agentName': searchRegex }
+      ];
+    }
+
+    // Convert limit and page to numbers, with safety limits
+    // When searching OR when limit is high (All Time), allow much higher limit to show all results
+    const pageNum = Math.max(1, parseInt(page) || 1);
+    const requestedLimit = parseInt(limit) || 10;
+    const isHighLimit = requestedLimit >= 1000; // "All Time" or search uses high limit
+    
+    let limitNum;
+    if (isSearching || isHighLimit) {
+      // When searching or "All Time", show all results (up to 10000 for safety)
+      limitNum = Math.min(10000, Math.max(1, requestedLimit));
+    } else {
+      // Normal pagination when not searching
+      limitNum = Math.min(1000, Math.max(1, requestedLimit));
+    }
+
+    // Determine sort order - default to newest first (orderDate descending)
+    let sortOrder = { orderDate: -1 }; // Default: newest first
 
     const salesOrders = await SalesOrder.find(query)
       .populate('items.productId', 'name sku')
       .populate('createdBy', 'firstName lastName')
-      .sort({ orderDate: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
+      .sort(sortOrder)
+      .limit(limitNum)
+      .skip((isSearching || isHighLimit) ? 0 : (pageNum - 1) * limitNum); // Skip pagination when searching or "All Time"
 
     const total = await SalesOrder.countDocuments(query);
 
     res.json({
       salesOrders,
-      totalPages: Math.ceil(total / limit),
-      currentPage: page,
+      totalPages: Math.ceil(total / limitNum),
+      currentPage: pageNum,
       total
     });
 
@@ -205,6 +418,111 @@ const getSalesOrderById = async (req, res) => {
 
   } catch (error) {
     console.error('Get sales order error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+// Update sales order (full update)
+const updateSalesOrder = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updateData = req.body;
+
+    const salesOrder = await SalesOrder.findById(id);
+    if (!salesOrder) {
+      return res.status(404).json({ error: 'Sales order not found' });
+    }
+
+    const oldStatus = salesOrder.status;
+    const newStatus = updateData.status;
+
+    // Update allowed fields
+    if (updateData.customerInfo) salesOrder.customerInfo = { ...salesOrder.customerInfo, ...updateData.customerInfo };
+    if (updateData.deliveryAddress) salesOrder.deliveryAddress = { ...salesOrder.deliveryAddress, ...updateData.deliveryAddress };
+    if (updateData.agentName !== undefined) salesOrder.agentName = updateData.agentName;
+    if (updateData.notes !== undefined) salesOrder.notes = updateData.notes;
+    if (updateData.items) {
+      salesOrder.items = updateData.items.map(item => ({
+        productId: item.productId,
+        variantId: item.variantId || null,
+        variantName: item.variantName || null,
+        quantity: item.quantity,
+        unitPrice: item.unitPrice,
+        totalPrice: item.quantity * item.unitPrice,
+        isOutOfStock: item.isOutOfStock || false
+      }));
+      // Recalculate total amount
+      salesOrder.totalAmount = salesOrder.items.reduce((sum, item) => sum + item.totalPrice, 0);
+    }
+    
+    // If status is being updated and it's different, update status separately to trigger warehouse logic
+    if (newStatus && newStatus !== oldStatus) {
+      salesOrder.status = newStatus;
+      // The pre-save hooks and status-specific logic will be handled by updateSalesOrderStatus logic
+      // For now, just update the status and let the existing save handle it
+    }
+    
+    await salesOrder.save();
+
+    // If status changed, apply warehouse updates using the same logic as status update
+    if (newStatus && newStatus !== oldStatus) {
+      const Warehouse = require('../models/Warehouse');
+      const StockMovement = require('../models/StockMovement');
+      
+      // Handle DISPATCH status - reserve stock
+      if (newStatus === 'dispatch' || newStatus === 'dispatched') {
+        const warehouses = await Warehouse.find({ isActive: true });
+        
+        for (const item of salesOrder.items) {
+          const itemProductId = (item.productId && item.productId._id)
+            ? item.productId._id.toString()
+            : item.productId.toString();
+          let quantityToReserve = item.quantity;
+          
+          for (const warehouse of warehouses) {
+            if (quantityToReserve <= 0) break;
+            
+            const stockItem = warehouse.currentStock.find(stock => 
+              stock.productId.toString() === itemProductId &&
+              (stock.variantId || null) === (item.variantId || null)
+            );
+            
+            if (stockItem) {
+              const availableQty = (stockItem.quantity || 0) - (stockItem.reservedQuantity || 0);
+              const reserveQty = Math.min(availableQty, quantityToReserve);
+              
+              if (reserveQty > 0) {
+                stockItem.reservedQuantity = (stockItem.reservedQuantity || 0) + reserveQty;
+                quantityToReserve -= reserveQty;
+                await warehouse.save();
+                
+                const stockMovement = new StockMovement({
+                  productId: item.productId,
+                  warehouseId: warehouse._id,
+                  movementType: 'reserved',
+                  quantity: reserveQty,
+                  previousQuantity: stockItem.quantity - stockItem.reservedQuantity + reserveQty,
+                  newQuantity: stockItem.quantity - stockItem.reservedQuantity,
+                  referenceType: 'sales_order',
+                  referenceId: salesOrder._id,
+                  notes: `Reserved for sales order ${salesOrder.orderNumber} (status change)`,
+                  createdBy: req.user?._id || salesOrder.createdBy
+                });
+                await stockMovement.save();
+              }
+            }
+          }
+        }
+      }
+      // Add more status transition logic as needed (delivered, confirmed_delivered, etc.)
+    }
+
+    res.json({ 
+      message: 'Sales order updated successfully',
+      salesOrder 
+    });
+  } catch (error) {
+    console.error('Update sales order error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 };
@@ -923,12 +1241,233 @@ const deleteSalesOrder = async (req, res) => {
   }
 };
 
+// Update QC status
+const updateQCStatus = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { qcStatus } = req.body;
+
+    if (!qcStatus || !['pending', 'approved', 'rejected'].includes(qcStatus)) {
+      return res.status(400).json({ error: 'Invalid QC status. Must be pending, approved, or rejected' });
+    }
+
+    const salesOrder = await SalesOrder.findById(id);
+    if (!salesOrder) {
+      return res.status(404).json({ error: 'Sales order not found' });
+    }
+
+    salesOrder.qcStatus = qcStatus;
+    await salesOrder.save();
+
+    res.json({ 
+      message: `QC status updated to ${qcStatus}`,
+      salesOrder 
+    });
+  } catch (error) {
+    console.error('Update QC status error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+// Check for duplicate phone numbers in sales orders
+const checkDuplicatePhoneNumbers = async (req, res) => {
+  try {
+    const { limit = 1000 } = req.query;
+    const limitNum = Math.min(parseInt(limit) || 1000, 5000); // Max 5000 for safety
+    
+    // Get all active sales orders
+    const allOrders = await SalesOrder.find({ 
+      isActive: { $ne: false },
+      'customerInfo.phone': { $exists: true, $ne: null, $ne: '' }
+    })
+    .select('orderNumber customerInfo items totalAmount timestamp status agentName')
+    .sort({ timestamp: -1 })
+    .limit(limitNum);
+    
+    // Group orders by normalized phone number
+    const phoneGroups = {};
+    
+    for (const order of allOrders) {
+      const phone = order.customerInfo?.phone;
+      if (!phone) continue;
+      
+      // Normalize phone number (remove spaces, dashes, convert to lowercase)
+      const normalizedPhone = phone.replace(/[\s-]/g, '').toLowerCase();
+      
+      if (!phoneGroups[normalizedPhone]) {
+        phoneGroups[normalizedPhone] = [];
+      }
+      phoneGroups[normalizedPhone].push(order);
+    }
+    
+    // Find phone numbers with multiple orders
+    const duplicatePhones = [];
+    
+    for (const [normalizedPhone, orders] of Object.entries(phoneGroups)) {
+      if (orders.length > 1) {
+        // Group by customer name to see if same customer or different customers
+        const customerGroups = {};
+        
+        for (const order of orders) {
+          const customerName = order.customerInfo?.name?.trim().toLowerCase() || 'Unknown';
+          if (!customerGroups[customerName]) {
+            customerGroups[customerName] = [];
+          }
+          customerGroups[customerName].push(order);
+        }
+        
+        const uniqueCustomers = Object.keys(customerGroups).length;
+        const totalOrders = orders.length;
+        
+        // Calculate statistics
+        const totalAmount = orders.reduce((sum, o) => sum + (o.totalAmount || 0), 0);
+        const statusCounts = {};
+        orders.forEach(o => {
+          statusCounts[o.status] = (statusCounts[o.status] || 0) + 1;
+        });
+        
+        duplicatePhones.push({
+          phoneNumber: orders[0].customerInfo.phone, // Original format
+          normalizedPhone: normalizedPhone,
+          totalOrders: totalOrders,
+          uniqueCustomers: uniqueCustomers,
+          totalAmount: totalAmount,
+          averageOrderAmount: totalAmount / totalOrders,
+          statusCounts: statusCounts,
+          orders: orders.map(order => ({
+            orderNumber: order.orderNumber,
+            timestamp: order.timestamp,
+            customerName: order.customerInfo?.name,
+            phone: order.customerInfo?.phone,
+            cnNumber: order.customerInfo?.cnNumber,
+            totalAmount: order.totalAmount,
+            status: order.status,
+            agentName: order.agentName,
+            itemsCount: order.items?.length || 0
+          })),
+          customers: Object.keys(customerGroups).map(name => ({
+            name: name,
+            orderCount: customerGroups[name].length,
+            orders: customerGroups[name].map(o => o.orderNumber)
+          })),
+          isSameCustomer: uniqueCustomers === 1,
+          message: uniqueCustomers === 1 
+            ? `Phone number used for ${totalOrders} orders by the same customer`
+            : `Phone number used for ${totalOrders} orders by ${uniqueCustomers} different customers`
+        });
+      }
+    }
+    
+    // Sort by total orders (descending)
+    duplicatePhones.sort((a, b) => b.totalOrders - a.totalOrders);
+    
+    // Calculate summary statistics
+    const summary = {
+      totalOrdersChecked: allOrders.length,
+      uniquePhoneNumbers: Object.keys(phoneGroups).length,
+      duplicatePhoneNumbers: duplicatePhones.length,
+      phoneNumbersWithMultipleOrders: duplicatePhones.filter(p => p.totalOrders > 1).length,
+      phoneNumbersWithDifferentCustomers: duplicatePhones.filter(p => !p.isSameCustomer).length,
+      totalOrdersWithDuplicates: duplicatePhones.reduce((sum, p) => sum + p.totalOrders, 0)
+    };
+    
+    res.json({
+      message: `Checked ${allOrders.length} orders for duplicate phone numbers`,
+      summary: summary,
+      duplicates: duplicatePhones
+    });
+    
+  } catch (error) {
+    console.error('Check duplicate phone numbers error:', error);
+    res.status(500).json({ error: 'Internal server error', details: error.message });
+  }
+};
+
+// Check for duplicate phone numbers for a specific phone number
+const checkPhoneNumberDuplicates = async (req, res) => {
+  try {
+    const { phone } = req.query;
+    
+    if (!phone) {
+      return res.status(400).json({ error: 'Phone number is required' });
+    }
+    
+    // Normalize phone number
+    const normalizedPhone = phone.replace(/[\s-]/g, '').toLowerCase();
+    const phoneRegex = new RegExp(normalizedPhone.replace(/[-\s]/g, '[\\s-]*'), 'i');
+    
+    // Find all orders with this phone number
+    const orders = await SalesOrder.find({
+      isActive: { $ne: false },
+      'customerInfo.phone': phoneRegex
+    })
+    .select('orderNumber customerInfo items totalAmount timestamp status agentName')
+    .sort({ timestamp: -1 });
+    
+    if (orders.length === 0) {
+      return res.json({
+        message: `No orders found for phone number: ${phone}`,
+        phoneNumber: phone,
+        orders: []
+      });
+    }
+    
+    // Group by customer name
+    const customerGroups = {};
+    for (const order of orders) {
+      const customerName = order.customerInfo?.name?.trim().toLowerCase() || 'Unknown';
+      if (!customerGroups[customerName]) {
+        customerGroups[customerName] = [];
+      }
+      customerGroups[customerName].push(order);
+    }
+    
+    const uniqueCustomers = Object.keys(customerGroups).length;
+    const totalAmount = orders.reduce((sum, o) => sum + (o.totalAmount || 0), 0);
+    
+    res.json({
+      message: `Found ${orders.length} order(s) for phone number: ${phone}`,
+      phoneNumber: phone,
+      normalizedPhone: normalizedPhone,
+      totalOrders: orders.length,
+      uniqueCustomers: uniqueCustomers,
+      totalAmount: totalAmount,
+      averageOrderAmount: totalAmount / orders.length,
+      isSameCustomer: uniqueCustomers === 1,
+      orders: orders.map(order => ({
+        orderNumber: order.orderNumber,
+        timestamp: order.timestamp,
+        customerName: order.customerInfo?.name,
+        phone: order.customerInfo?.phone,
+        cnNumber: order.customerInfo?.cnNumber,
+        totalAmount: order.totalAmount,
+        status: order.status,
+        agentName: order.agentName,
+        itemsCount: order.items?.length || 0
+      })),
+      customers: Object.keys(customerGroups).map(name => ({
+        name: name,
+        orderCount: customerGroups[name].length,
+        orders: customerGroups[name].map(o => o.orderNumber)
+      }))
+    });
+    
+  } catch (error) {
+    console.error('Check phone number duplicates error:', error);
+    res.status(500).json({ error: 'Internal server error', details: error.message });
+  }
+};
+
 module.exports = {
   createSalesOrder,
   getAllSalesOrders,
   getSalesOrderById,
+  updateSalesOrder,
   updateSalesOrderStatus,
   dispatchSalesOrder,
   markDeliveryCompleted,
-  deleteSalesOrder
+  deleteSalesOrder,
+  updateQCStatus,
+  checkDuplicatePhoneNumbers,
+  checkPhoneNumberDuplicates
 };

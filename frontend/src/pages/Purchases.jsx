@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { ShoppingCart, Plus, Package, DollarSign, Calendar, Clock, Filter, RefreshCw, FileText, Receipt, CheckCircle, AlertCircle, Grid3X3, List } from 'lucide-react';
+import { ShoppingCart, Plus, Package, DollarSign, Calendar, Clock, Filter, RefreshCw, FileText, Receipt, CheckCircle, AlertCircle, Grid3X3, List, Table2, X, Search, Eye } from 'lucide-react';
 import CenteredLoader from '../components/CenteredLoader';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
@@ -21,22 +21,149 @@ const Purchases = () => {
     totalItems: 0,
     totalValue: user?.role === 'admin' ? 0 : null // Hide financial data for managers
   });
-  const [timeFilter, setTimeFilter] = useState('all'); // all, day, week, month
+  const [timeFilter, setTimeFilter] = useState('day'); // all, day, week, month - default to 'day' (today)
   const [sortFilter, setSortFilter] = useState('newest'); // newest, oldest, amount_high, amount_low, status
   const [selectedDate, setSelectedDate] = useState(''); // For calendar date picker
   const [refreshing, setRefreshing] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
   const [itemsPerPage] = useState(10);
-  const [viewMode, setViewMode] = useState('list'); // 'grid' or 'list'
+  const [viewMode, setViewMode] = useState('table'); // 'grid', 'list', or 'table'
+  const [searchTerm, setSearchTerm] = useState(''); // Search filter for supplier name, phone, purchase number
+  const [totalPurchasesCount, setTotalPurchasesCount] = useState(0); // Total purchases count from server
+  const [products, setProducts] = useState([]);
+  const [productsLoading, setProductsLoading] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
 
-  // Fetch purchases data
+  const normalizeKey = (value) => {
+    if (!value) return '';
+    return String(value).toLowerCase().trim().replace(/\s+/g, ' ');
+  };
+
+  const findProductById = (productRef) => {
+    if (!productRef) return null;
+    const productId = typeof productRef === 'object' && productRef._id ? productRef._id : productRef;
+    return products.find(product => product._id && product._id.toString() === productId.toString());
+  };
+
+  const getCanonicalProductName = (productRef, fallbackName = 'Unknown Product') => {
+    const product = findProductById(productRef);
+    return product?.name || fallbackName;
+  };
+
+  const getCanonicalVariantName = (productRef, variantId, fallbackName = '') => {
+    const product = findProductById(productRef);
+    const normalizedFallback = normalizeKey(fallbackName);
+
+    if (!variantId || variantId === 'no-variant') {
+      if (
+        product &&
+        product.hasVariants &&
+        Array.isArray(product.variants) &&
+        normalizedFallback && normalizedFallback !== ''
+      ) {
+        const matchedVariantByName = product.variants.find(
+          (variant) => normalizeKey(variant.name) === normalizedFallback
+        );
+        if (matchedVariantByName?.name) {
+          return matchedVariantByName.name;
+        }
+      }
+      return fallbackName || '';
+    }
+
+    if (product && product.hasVariants && Array.isArray(product.variants)) {
+      const matchedVariantById = product.variants.find(
+        (variant) => {
+          const candidateId = variant._id || variant.sku;
+          return candidateId && candidateId.toString() === variantId.toString();
+        }
+      );
+      if (matchedVariantById?.name) {
+        return matchedVariantById.name;
+      }
+
+      if (normalizedFallback && normalizedFallback !== '') {
+        const matchedVariantByName = product.variants.find(
+          (variant) => normalizeKey(variant.name) === normalizedFallback
+        );
+        if (matchedVariantByName?.name) {
+          return matchedVariantByName.name;
+        }
+      }
+    }
+
+    return fallbackName || '';
+  };
+
+  // Fetch purchases data with server-side pagination
   const fetchPurchases = async () => {
     try {
       setRefreshing(true);
-      const response = await api.get('/purchases?limit=1000'); // Fetch all purchases
+      // When searching OR "All Time" is selected, show ALL results (no pagination limit)
+      // Otherwise, use normal pagination
+      const isSearching = searchTerm.trim().length > 0;
+      const isAllTime = timeFilter === 'all';
+      const showAllResults = isSearching || isAllTime;
+      
+      const pageSize = showAllResults ? 10000 : itemsPerPage; // Show all results when searching or "All Time"
+      const params = new URLSearchParams({
+        page: showAllResults ? '1' : currentPage.toString(), // Always page 1 when showing all results
+        limit: pageSize.toString()
+      });
+      
+      // Add search to backend if provided
+      if (searchTerm.trim()) {
+        params.append('search', searchTerm.trim());
+      }
+      
+      // Add time filter to backend
+      if (timeFilter !== 'all') {
+        const now = new Date();
+        let startDate;
+        
+        switch (timeFilter) {
+          case 'day':
+            startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            break;
+          case 'week':
+            startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+            break;
+          case 'month':
+            startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+            break;
+          case '90days':
+            startDate = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+            break;
+          case 'year':
+            startDate = new Date(now.getFullYear(), 0, 1);
+            break;
+          case 'custom':
+            if (selectedDate) {
+              startDate = new Date(selectedDate);
+              startDate.setHours(0, 0, 0, 0);
+              const endDate = new Date(selectedDate);
+              endDate.setHours(23, 59, 59, 999);
+              params.append('startDate', startDate.toISOString());
+              params.append('endDate', endDate.toISOString());
+            }
+            break;
+          default:
+            break;
+        }
+        
+        if (timeFilter !== 'custom' && startDate) {
+          params.append('startDate', startDate.toISOString());
+        }
+      }
+      
+      const response = await api.get(`/purchases?${params.toString()}`);
       let purchasesData = response.data?.purchases || [];
+      const totalFromServer = response.data?.total || 0;
+
+      if (!products || products.length === 0) {
+        await fetchProducts();
+      }
       
       // Check for temporary purchases in localStorage (newly created ones)
       const tempPurchases = JSON.parse(localStorage.getItem('tempPurchases') || '[]');
@@ -50,17 +177,33 @@ const Purchases = () => {
         localStorage.removeItem('tempPurchases');
       }
       
-      // Sort by creation date - newest first
-      const sortedPurchases = purchasesData.sort((a, b) => {
-        return new Date(b.createdAt || b._id) - new Date(a.createdAt || a._id);
+      // Apply client-side sorting based on sortFilter
+      const sortedPurchases = [...purchasesData].sort((a, b) => {
+        switch (sortFilter) {
+          case 'newest':
+            return new Date(b.purchaseDate || b.createdAt || b._id) - new Date(a.purchaseDate || a.createdAt || a._id);
+          case 'oldest':
+            return new Date(a.purchaseDate || a.createdAt || a._id) - new Date(b.purchaseDate || b.createdAt || b._id);
+          case 'amount_high':
+            return (b.totalAmount || 0) - (a.totalAmount || 0);
+          case 'amount_low':
+            return (a.totalAmount || 0) - (b.totalAmount || 0);
+          case 'status':
+            return (a.status || '').localeCompare(b.status || '');
+          default:
+            return new Date(b.purchaseDate || b.createdAt || b._id) - new Date(a.purchaseDate || a.createdAt || a._id);
+        }
       });
       
       // Always use real data from API, even if empty
       setPurchases(sortedPurchases);
       
+      // Store total for pagination
+      setTotalPurchasesCount(totalFromServer);
+      
       // Calculate stats from real data (will be 0 if no purchases)
       const stats = {
-        totalPurchases: purchasesData.length,
+        totalPurchases: totalFromServer || purchasesData.length,
         totalItems: purchasesData.reduce((sum, purchase) => 
           sum + (purchase.items ? purchase.items.reduce((itemSum, item) => itemSum + item.quantity, 0) : 0), 0),
         totalValue: user?.role === 'admin' ? purchasesData.reduce((sum, purchase) => sum + (purchase.totalAmount || 0), 0) : null
@@ -84,6 +227,31 @@ const Purchases = () => {
     } finally {
       setLoading(false);
       setRefreshing(false);
+    }
+  };
+
+  const fetchProducts = async () => {
+    try {
+      setProductsLoading(true);
+      const response = await api.get('/products');
+      let productsData = [];
+      if (response.data) {
+        if (Array.isArray(response.data)) {
+          productsData = response.data;
+        } else if (Array.isArray(response.data?.products)) {
+          productsData = response.data.products;
+        } else if (Array.isArray(response.data?.data)) {
+          productsData = response.data.data;
+        }
+      }
+      setProducts(productsData);
+      return productsData;
+    } catch (error) {
+      console.error('Error fetching products:', error);
+      setProducts([]);
+      return [];
+    } finally {
+      setProductsLoading(false);
     }
   };
 
@@ -183,7 +351,13 @@ const Purchases = () => {
   };
 
   useEffect(() => {
-    fetchPurchases();
+    const initialize = async () => {
+      await fetchProducts();
+      await fetchPurchases();
+    };
+
+    initialize();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Check for temporary purchases on component mount
@@ -263,74 +437,6 @@ const Purchases = () => {
 
   // Removed auto-refresh to prevent UI disturbance
 
-  // Filter purchases by time period
-  const getFilteredPurchases = () => {
-    let filteredPurchases = purchases;
-    
-    // Apply time filter
-    if (timeFilter !== 'all') {
-      const now = new Date();
-      let filterDate;
-      
-      switch (timeFilter) {
-        case 'day':
-          filterDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-          break;
-        case 'week':
-          filterDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-          break;
-        case 'month':
-          filterDate = new Date(now.getFullYear(), now.getMonth(), 1);
-          break;
-        case '90days':
-          filterDate = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
-          break;
-        case 'year':
-          filterDate = new Date(now.getFullYear(), 0, 1);
-          break;
-        case 'custom':
-          // Handle custom date selection
-          if (selectedDate) {
-            const selected = new Date(selectedDate);
-            const startOfDay = new Date(selected.getFullYear(), selected.getMonth(), selected.getDate());
-            const endOfDay = new Date(selected.getFullYear(), selected.getMonth(), selected.getDate() + 1);
-            filteredPurchases = purchases.filter(purchase => {
-              const purchaseDate = new Date(purchase.purchaseDate || purchase.createdAt);
-              return purchaseDate >= startOfDay && purchaseDate < endOfDay;
-            });
-            return filteredPurchases;
-          }
-          break;
-        default:
-          break;
-      }
-      
-      if (timeFilter !== 'custom') {
-        filteredPurchases = purchases.filter(purchase => new Date(purchase.purchaseDate || purchase.createdAt) >= filterDate);
-      }
-    }
-    
-    // Apply sort filter
-    const sortedPurchases = [...filteredPurchases].sort((a, b) => {
-      switch (sortFilter) {
-        case 'newest':
-          return new Date(b.createdAt || b._id) - new Date(a.createdAt || a._id);
-        case 'oldest':
-          return new Date(a.createdAt || a._id) - new Date(b.createdAt || b._id);
-        case 'amount_high':
-          return (b.totalAmount || 0) - (a.totalAmount || 0);
-        case 'amount_low':
-          return (a.totalAmount || 0) - (b.totalAmount || 0);
-        case 'status':
-          return (a.status || '').localeCompare(b.status || '');
-        default:
-          return 0;
-      }
-    });
-    
-    return sortedPurchases;
-  };
-
   // Handle filter change
   const handleFilterChange = (newFilter) => {
     setTimeFilter(newFilter);
@@ -355,24 +461,120 @@ const Purchases = () => {
     fetchPurchases();
   };
 
-  // Pagination calculations
-  const filteredPurchases = getFilteredPurchases();
-  const totalPages = Math.ceil(filteredPurchases.length / itemsPerPage);
-  const indexOfLastItem = currentPage * itemsPerPage;
-  const indexOfFirstItem = indexOfLastItem - itemsPerPage;
-  const currentPurchases = filteredPurchases.slice(indexOfFirstItem, indexOfLastItem);
+  // When "All Time" is selected or searching, purchases state contains ALL results from server
+  // Otherwise, apply client-side time filters (for day, week, month, etc.)
+  let filteredPurchases = purchases;
+  const isAllTime = timeFilter === 'all';
+  const isSearching = searchTerm.trim().length > 0;
+  
+  // Only apply client-side time filters if not "All Time" and not searching
+  if (!isAllTime && !isSearching) {
+    // Apply client-side time filter
+    const now = new Date();
+    let filterDate;
+    
+    switch (timeFilter) {
+      case 'day':
+        filterDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        filteredPurchases = purchases.filter(purchase => {
+          const purchaseDate = new Date(purchase.purchaseDate || purchase.createdAt);
+          return purchaseDate >= filterDate;
+        });
+        break;
+      case 'week':
+        filterDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        filteredPurchases = purchases.filter(purchase => {
+          const purchaseDate = new Date(purchase.purchaseDate || purchase.createdAt);
+          return purchaseDate >= filterDate;
+        });
+        break;
+      case 'month':
+        filterDate = new Date(now.getFullYear(), now.getMonth(), 1);
+        filteredPurchases = purchases.filter(purchase => {
+          const purchaseDate = new Date(purchase.purchaseDate || purchase.createdAt);
+          return purchaseDate >= filterDate;
+        });
+        break;
+      case '90days':
+        filterDate = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+        filteredPurchases = purchases.filter(purchase => {
+          const purchaseDate = new Date(purchase.purchaseDate || purchase.createdAt);
+          return purchaseDate >= filterDate;
+        });
+        break;
+      case 'year':
+        filterDate = new Date(now.getFullYear(), 0, 1);
+        filteredPurchases = purchases.filter(purchase => {
+          const purchaseDate = new Date(purchase.purchaseDate || purchase.createdAt);
+          return purchaseDate >= filterDate;
+        });
+        break;
+      case 'custom':
+        if (selectedDate) {
+          const selected = new Date(selectedDate);
+          const startOfDay = new Date(selected.getFullYear(), selected.getMonth(), selected.getDate());
+          const endOfDay = new Date(selected.getFullYear(), selected.getMonth(), selected.getDate() + 1);
+          filteredPurchases = purchases.filter(purchase => {
+            const purchaseDate = new Date(purchase.purchaseDate || purchase.createdAt);
+            return purchaseDate >= startOfDay && purchaseDate < endOfDay;
+          });
+        }
+        break;
+      default:
+        break;
+    }
+    
+    // Apply client-side sorting
+    filteredPurchases = [...filteredPurchases].sort((a, b) => {
+      switch (sortFilter) {
+        case 'newest':
+          return new Date(b.purchaseDate || b.createdAt || b._id) - new Date(a.purchaseDate || a.createdAt || a._id);
+        case 'oldest':
+          return new Date(a.purchaseDate || a.createdAt || a._id) - new Date(b.purchaseDate || b.createdAt || b._id);
+        case 'amount_high':
+          return (b.totalAmount || 0) - (a.totalAmount || 0);
+        case 'amount_low':
+          return (a.totalAmount || 0) - (b.totalAmount || 0);
+        case 'status':
+          return (a.status || '').localeCompare(b.status || '');
+        default:
+          return new Date(b.purchaseDate || b.createdAt || b._id) - new Date(a.purchaseDate || a.createdAt || a._id);
+      }
+    });
+  } else {
+    // For "All Time" or when searching, sorting is already applied in fetchPurchases
+    filteredPurchases = purchases;
+  }
+  
+  // When "All Time" or searching, show ALL results (no pagination)
+  // Otherwise, use pagination
+  const showPagination = !isAllTime && !isSearching;
+  const totalPages = showPagination ? Math.ceil((totalPurchasesCount || filteredPurchases.length) / itemsPerPage) : 1;
+  const indexOfLastItem = showPagination ? currentPage * itemsPerPage : filteredPurchases.length;
+  const indexOfFirstItem = showPagination ? indexOfLastItem - itemsPerPage : 0;
+  const currentPurchases = showPagination ? filteredPurchases.slice(indexOfFirstItem, indexOfLastItem) : filteredPurchases;
+
+  // Refetch when page, search, or time filter changes
+  useEffect(() => {
+    fetchPurchases();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentPage, searchTerm, timeFilter, selectedDate]);
 
   // Reset to page 1 when filter changes
   useEffect(() => {
     setCurrentPage(1);
-  }, [timeFilter, sortFilter, selectedDate]);
+  }, [timeFilter, sortFilter, selectedDate, searchTerm]);
 
-  // Export purchases data
+  // Export purchases data - exports ALL filtered/search results
   const handleExportPurchases = async (format = 'excel') => {
     try {
-      const filteredData = getFilteredPurchases();
+      // filteredPurchases contains ALL search results when searching, or all filtered results when not searching
+      const dataToExport = filteredPurchases.length > 0 ? filteredPurchases : purchases;
       const { exportPurchases } = await import('../utils/exportUtils');
-      const result = exportPurchases(filteredData, format);
+      const filename = searchTerm.trim() 
+        ? `purchases-search-${searchTerm.trim().replace(/[^a-zA-Z0-9]/g, '-')}` 
+        : 'purchases';
+      const result = exportPurchases(dataToExport, format, filename);
       return result;
     } catch (error) {
       console.error('Export error in handleExportPurchases:', error);
@@ -484,33 +686,35 @@ const Purchases = () => {
           </p>
         </div>
         <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
-          {/* View Toggle */}
-          <div className="flex items-center bg-gray-100 rounded-lg p-1">
-            <button
-              onClick={() => setViewMode('grid')}
-              className={`flex items-center px-3 py-1.5 rounded-md transition-all duration-200 ${
-                viewMode === 'grid'
-                  ? 'bg-white text-blue-600 shadow-sm'
-                  : 'text-gray-600 hover:text-gray-900'
-              }`}
-              title="Grid View"
-            >
-              <Grid3X3 className="h-4 w-4 mr-1" />
-              <span className="hidden sm:inline text-sm font-medium">Grid</span>
-            </button>
-            <button
-              onClick={() => setViewMode('list')}
-              className={`flex items-center px-3 py-1.5 rounded-md transition-all duration-200 ${
-                viewMode === 'list'
-                  ? 'bg-white text-blue-600 shadow-sm'
-                  : 'text-gray-600 hover:text-gray-900'
-              }`}
-              title="List View"
-            >
-              <List className="h-4 w-4 mr-1" />
-              <span className="hidden sm:inline text-sm font-medium">List</span>
-            </button>
-          </div>
+          {/* View Toggle - Hidden for agents */}
+          {user?.role !== 'agent' && (
+            <div className="flex items-center bg-gray-100 rounded-lg p-1">
+              <button
+                onClick={() => setViewMode('list')}
+                className={`flex items-center px-3 py-1.5 rounded-md transition-all duration-200 ${
+                  viewMode === 'list'
+                    ? 'bg-white text-blue-600 shadow-sm'
+                    : 'text-gray-600 hover:text-gray-900'
+                }`}
+                title="List View"
+              >
+                <List className="h-4 w-4 mr-1" />
+                <span className="hidden sm:inline text-sm font-medium">List</span>
+              </button>
+              <button
+                onClick={() => setViewMode('table')}
+                className={`flex items-center px-3 py-1.5 rounded-md transition-all duration-200 ${
+                  viewMode === 'table'
+                    ? 'bg-white text-blue-600 shadow-sm'
+                    : 'text-gray-600 hover:text-gray-900'
+                }`}
+                title="Table View"
+              >
+                <Table2 className="h-4 w-4 mr-1" />
+                <span className="hidden sm:inline text-sm font-medium">Table</span>
+              </button>
+            </div>
+          )}
           
           <button 
             onClick={handleRefresh}
@@ -522,9 +726,9 @@ const Purchases = () => {
             <span className="hidden sm:inline">Refresh</span>
           </button>
           <ExportButton
-            data={getFilteredPurchases()}
-            filename="purchases"
-            title="Purchase Report"
+            data={filteredPurchases}
+            filename={searchTerm.trim() ? `purchases-search-${searchTerm.trim().replace(/[^a-zA-Z0-9]/g, '-')}` : 'purchases'}
+            title={searchTerm.trim() ? `Purchase Report - Search: ${searchTerm.trim()}` : 'Purchase Report'}
             exportFunction={handleExportPurchases}
             variant="default"
             buttonText="Export"
@@ -598,11 +802,40 @@ const Purchases = () => {
         )}
       </div>
 
+      {/* Search Filter */}
+      <div className="mt-6 mb-4">
+        <div className="relative max-w-md">
+          <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
+          <input
+            type="text"
+            placeholder="Search by supplier name, phone, or purchase number..."
+            value={searchTerm}
+            onChange={(e) => {
+              setSearchTerm(e.target.value);
+              setCurrentPage(1); // Reset to first page when searching
+            }}
+            className="input-field pl-10 pr-10"
+          />
+          {searchTerm && (
+            <button
+              onClick={() => {
+                setSearchTerm('');
+                setCurrentPage(1);
+              }}
+              className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-gray-600"
+              title="Clear search"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          )}
+        </div>
+      </div>
+
       {/* Purchase Records Section */}
       <div className="card p-4 sm:p-5 md:p-6">
         <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center mb-4 sm:mb-6 gap-3">
           <h2 className="text-base sm:text-lg font-semibold text-gray-900">
-            Purchase Records ({filteredPurchases.length} of {purchases.length} total)
+            Purchase Records ({searchTerm.trim() ? `${filteredPurchases.length} of ${totalPurchasesCount}` : `${filteredPurchases.length} of ${totalPurchasesCount || purchases.length}`} total)
           </h2>
           <div className="flex items-center gap-2 sm:gap-3 flex-wrap sm:flex-nowrap">
             <select
@@ -680,206 +913,348 @@ const Purchases = () => {
           </div>
         ) : (
           <>
-            <div className={viewMode === 'grid' ? 'grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-3 sm:gap-4 lg:gap-6' : 'space-y-3 sm:space-y-4'}>
-              {currentPurchases.map((purchase) => (
-              <motion.div
-                key={purchase._id}
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                className={`border rounded-lg p-3 sm:p-4 hover:shadow-md transition-all duration-300 ${
-                  newlyAddedPurchaseId === purchase._id 
-                    ? 'border-green-500 bg-green-50 shadow-lg ring-2 ring-green-200' 
-                    : 'border-gray-200'
-                }`}
-              >
-                <div className="flex flex-col lg:flex-row lg:justify-between lg:items-start gap-3 sm:gap-4">
-                  <div className="flex-1 min-w-0">
-                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-2 gap-2">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span className="font-semibold text-gray-900 text-sm sm:text-base">{purchase.purchaseNumber}</span>
-                        <span className={`px-2 py-0.5 sm:py-1 rounded-full text-xs font-medium whitespace-nowrap ${
-                          purchase.status === 'received' ? 'bg-green-100 text-green-800' :
-                          purchase.status === 'pending' ? 'bg-yellow-100 text-yellow-800' :
-                          'bg-gray-100 text-gray-800'
-                        }`}>
-                          {purchase.status}
-                        </span>
+            {viewMode === 'table' ? (
+              // Table View
+              <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Purchase Number
+                      </th>
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Date
+                      </th>
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Supplier Name
+                      </th>
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Supplier Phone
+                      </th>
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Product Name
+                      </th>
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Quantity
+                      </th>
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Total Amount
+                      </th>
+                      {user?.role === 'admin' && (
+                        <>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Status
+                          </th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                            Payment Status
+                          </th>
+                        </>
+                      )}
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Actions
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="bg-white divide-y divide-gray-200">
+                    {currentPurchases.map((purchase) => (
+                      <tr key={purchase._id} className="hover:bg-gray-50">
+                        <td className="px-6 py-4 whitespace-nowrap">
+                          <div className="text-sm font-semibold text-gray-900">{purchase.purchaseNumber}</div>
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap">
+                          <div className="text-sm text-gray-900">
+                            {purchase.purchaseDate ? new Date(purchase.purchaseDate).toLocaleDateString() : 
+                             purchase.createdAt ? new Date(purchase.createdAt).toLocaleDateString() : '-'}
+                          </div>
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap">
+                          <div className="text-sm text-gray-900">{purchase.supplierId?.name || 'N/A'}</div>
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap">
+                          <div className="text-sm text-gray-900">{purchase.supplierId?.phone || '-'}</div>
+                        </td>
+                        <td className="px-6 py-4">
+                          <div className="text-sm text-gray-900">
+                            {purchase.items && purchase.items.length > 0 ? (
+                              purchase.items.slice(0, 3).map((item, idx) => {
+                                const canonicalProductName = getCanonicalProductName(item.productId, item.productId?.name || item.productName || 'Unknown Product');
+                                const canonicalVariantName = getCanonicalVariantName(item.productId, item.variantId, item.variantName);
+                                return (
+                                  <div key={idx}>
+                                    {idx > 0 && <hr className="my-2 border-gray-300" />}
+                                    <div className="text-sm text-gray-600 mb-1">
+                                      {canonicalProductName}
+                                      {canonicalVariantName ? ` - ${canonicalVariantName}` : ''}
+                                    </div>
+                                  </div>
+                                );
+                              })
+                            ) : (
+                              <span className="text-gray-400">-</span>
+                            )}
+                            {purchase.items?.length > 3 && (
+                              <div className="text-sm text-gray-500 mt-1">+{purchase.items.length - 3} more</div>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-6 py-4">
+                          <div className="text-sm text-gray-900">
+                            {purchase.items && purchase.items.length > 0 ? (
+                              purchase.items.slice(0, 3).map((item, idx) => (
+                                <div key={idx}>
+                                  {idx > 0 && <hr className="my-2 border-gray-300" />}
+                                  <div className="text-sm text-gray-600 mb-1">{item.quantity}</div>
+                                </div>
+                              ))
+                            ) : (
+                              <span className="text-gray-400">-</span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap">
+                          <div className="text-sm font-semibold text-green-600">
+                            PKR {purchase.totalAmount?.toLocaleString() || '0'}
+                          </div>
+                        </td>
                         {user?.role === 'admin' && (
                           <>
-                            <span className={`px-2 py-0.5 sm:py-1 rounded-full text-xs font-medium whitespace-nowrap ${
-                              purchase.paymentStatus === 'paid' ? 'bg-green-100 text-green-800' :
-                              purchase.paymentStatus === 'pending' ? 'bg-yellow-100 text-yellow-800' :
-                              purchase.paymentStatus === 'partial' ? 'bg-blue-100 text-blue-800' :
-                              'bg-red-100 text-red-800'
-                            }`}>
-                              {purchase.paymentStatus}
-                            </span>
-                            
-                            {/* Partial Payment Info */}
-                            {purchase.paymentStatus === 'partial' && purchase.advancePayment > 0 && (
-                              <div className="text-xs text-gray-600 mt-1">
-                                <span className="font-medium">Advance:</span> PKR {purchase.advancePayment.toFixed(2)} | 
-                                <span className="font-medium ml-1">Remaining:</span> PKR {(purchase.remainingPayment || 0).toFixed(2)}
-                              </div>
-                            )}
+                            <td className="px-6 py-4 whitespace-nowrap">
+                              <span className={`inline-flex px-2 py-1 rounded-full text-xs font-medium ${
+                                purchase.status === 'received' ? 'bg-green-100 text-green-800' :
+                                purchase.status === 'pending' ? 'bg-yellow-100 text-yellow-800' :
+                                'bg-gray-100 text-gray-800'
+                              }`}>
+                                {purchase.status || 'Pending'}
+                              </span>
+                            </td>
+                            <td className="px-6 py-4 whitespace-nowrap">
+                              <span className={`inline-flex px-2 py-1 rounded-full text-xs font-medium ${
+                                purchase.paymentStatus === 'paid' ? 'bg-green-100 text-green-800' :
+                                purchase.paymentStatus === 'pending' ? 'bg-yellow-100 text-yellow-800' :
+                                purchase.paymentStatus === 'partial' ? 'bg-blue-100 text-blue-800' :
+                                'bg-red-100 text-red-800'
+                              }`}>
+                                {purchase.paymentStatus || 'Pending'}
+                              </span>
+                            </td>
                           </>
                         )}
-                      </div>
-                      
-                      {/* Action Buttons - Admin Only */}
-                      {user?.role === 'admin' && (
-                        <div className="flex items-center gap-1 sm:gap-2">
-                          {/* Generate Invoice */}
-                          {!purchase.invoiceGenerated && (
+                        <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                          <div className="flex items-center gap-2">
+                            {user?.role === 'admin' && (
+                              <>
+                                {!purchase.invoiceGenerated && (
+                                  <button
+                                    onClick={() => handleGenerateInvoice(purchase._id)}
+                                    className="text-blue-600 hover:text-blue-900"
+                                    title="Generate Invoice"
+                                  >
+                                    <FileText className="w-4 h-4" />
+                                  </button>
+                                )}
+                                {purchase.invoiceGenerated && (
+                                  <button
+                                    onClick={() => handleDownloadDocument(purchase._id, 'invoice', 'pdf')}
+                                    className="text-blue-600 hover:text-blue-900"
+                                    title="Download Invoice"
+                                  >
+                                    <FileText className="w-4 h-4" />
+                                  </button>
+                                )}
+                                {purchase.paymentStatus !== 'paid' && (
+                                  <button
+                                    onClick={() => handleMarkPaymentCleared(purchase._id)}
+                                    className="text-green-600 hover:text-green-900"
+                                    title="Mark Payment Cleared"
+                                  >
+                                    <CheckCircle className="w-4 h-4" />
+                                  </button>
+                                )}
+                              </>
+                            )}
                             <button
-                              onClick={() => handleGenerateInvoice(purchase._id)}
-                              className="p-2 text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded-lg transition-colors duration-200"
-                              title="Generate Invoice"
+                              onClick={() => {
+                                // View purchase details - you can add a modal here
+                                console.log('View purchase:', purchase._id);
+                              }}
+                              className="text-gray-600 hover:text-gray-900"
+                              title="View Details"
                             >
-                              <FileText className="w-4 h-4" />
+                              <Eye className="w-4 h-4" />
                             </button>
-                          )}
-                          
-                          {/* Download Invoice */}
-                          {purchase.invoiceGenerated && (
-                            <div className="flex items-center space-x-1">
-                              <button
-                                onClick={() => handleDownloadDocument(purchase._id, 'invoice', 'pdf')}
-                                className="p-2 text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded-lg transition-colors duration-200"
-                                title="Download Invoice (PDF)"
-                              >
-                                <FileText className="w-4 h-4" />
-                              </button>
-                              <span className="text-xs text-green-600 font-medium">INV</span>
-                            </div>
-                          )}
-                          
-                          {/* Clear Payment */}
-                          {purchase.paymentStatus !== 'paid' && (
-                            <button
-                              onClick={() => handleMarkPaymentCleared(purchase._id)}
-                              className="p-2 text-green-600 hover:text-green-800 hover:bg-green-50 rounded-lg transition-colors duration-200"
-                              title="Mark Payment Cleared"
-                            >
-                              <CheckCircle className="w-4 h-4" />
-                            </button>
-                          )}
-                          
-                          {/* Download Receipt */}
-                          {purchase.receiptGenerated && (
-                            <div className="flex items-center space-x-1">
-                              <button
-                                onClick={() => handleDownloadDocument(purchase._id, 'receipt', 'pdf')}
-                                className="p-2 text-green-600 hover:text-green-800 hover:bg-green-50 rounded-lg transition-colors duration-200"
-                                title="Download Receipt (PDF)"
-                              >
-                                <Receipt className="w-4 h-4" />
-                              </button>
-                              <span className="text-xs text-green-600 font-medium">REC</span>
-                            </div>
-                          )}
-                          
-                          {/* Payment Status Indicator */}
-                          {purchase.paymentStatus === 'paid' && !purchase.receiptGenerated && (
-                            <div className="flex items-center space-x-1 text-green-600">
-                              <CheckCircle className="w-4 h-4" />
-                              <span className="text-xs font-medium">PAID</span>
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 sm:gap-3 text-xs sm:text-sm text-gray-600">
-                      <div className="flex items-center">
-                        <Calendar className="w-3 h-3 sm:w-4 sm:h-4 mr-1 sm:mr-2 flex-shrink-0" />
-                        <span className="truncate">{new Date(purchase.purchaseDate || purchase.createdAt).toLocaleDateString()}</span>
-                      </div>
-                      <div className="flex items-center">
-                        <Package className="w-3 h-3 sm:w-4 sm:h-4 mr-1 sm:mr-2 flex-shrink-0" />
-                        <span>{purchase.items.length} items</span>
-                      </div>
-                      {user?.role === 'admin' && (
-                        <div className="flex items-center">
-                          <DollarSign className="w-3 h-3 sm:w-4 sm:h-4 mr-1 sm:mr-2 flex-shrink-0" />
-                          <span className="font-medium truncate">PKR {purchase.totalAmount?.toLocaleString()}</span>
-                        </div>
-                      )}
-                    </div>
-                    {user?.role === 'admin' ? (
-                      <div className="mt-2 sm:mt-3">
-                        <p className="text-xs sm:text-sm text-gray-500 mb-1 sm:mb-2">Items:</p>
-                        <div className="flex flex-wrap gap-1.5 sm:gap-2">
-                          {purchase.items.slice(0, 3).map((item, index) => {
-                            const productName = item.productId?.name || 'Unknown Product';
-                            const variantName = item.variantName ? ` - ${item.variantName}` : '';
-                            const displayName = `${productName}${variantName}`;
-                            
-                            return (
-                              <span
-                                key={index}
-                                className="px-2 py-0.5 sm:py-1 bg-blue-100 text-blue-800 rounded-full text-xs truncate max-w-[200px]"
-                                title={`${displayName} (x${item.quantity})`}
-                              >
-                                {displayName} (x{item.quantity})
-                              </span>
-                            );
-                          })}
-                          {purchase.items.length > 3 && (
-                            <span className="px-2 py-0.5 sm:py-1 bg-gray-100 text-gray-600 rounded-full text-xs whitespace-nowrap">
-                              +{purchase.items.length - 3} more
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="mt-2 sm:mt-3">
-                        <p className="text-xs sm:text-sm text-gray-500 mb-1 sm:mb-2">Supplier Profile:</p>
-                        <div className="bg-gray-50 rounded-lg p-3">
-                          <div className="flex items-center gap-2 mb-2">
-                            <div className="w-8 h-8 bg-blue-100 rounded-full flex items-center justify-center">
-                              <span className="text-blue-600 font-semibold text-sm">
-                                {(purchase.supplierId?.name || 'Unknown').charAt(0).toUpperCase()}
-                              </span>
-                            </div>
-                            <div>
-                              <p className="font-medium text-gray-900 text-sm">{purchase.supplierId?.name || 'Unknown Supplier'}</p>
-                              <p className="text-xs text-gray-500">{purchase.supplierId?.email || 'No email'}</p>
-                            </div>
                           </div>
-                          <div className="text-xs text-gray-600">
-                            <p><span className="font-medium">Phone:</span> {purchase.supplierId?.phone || 'Not provided'}</p>
-                            <p><span className="font-medium">Location:</span> {purchase.supplierId?.address || 'Not provided'}</p>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                  {user?.role === 'admin' ? (
-                    <div className="lg:text-right border-t lg:border-t-0 lg:border-l border-gray-200 pt-3 lg:pt-0 lg:pl-4 min-w-0 flex-shrink-0">
-                      <div className="text-xs sm:text-sm text-gray-500 mb-1 sm:mb-2">
-                        <span className="font-medium">Supplier:</span> {purchase.supplierId?.name || 'Unknown'}
-                      </div>
-                      <div className="text-xs text-gray-400 mb-2">
-                        {purchase.receivedDate ? `Received: ${new Date(purchase.receivedDate).toLocaleDateString()}` : 'Not received yet'}
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="lg:text-right border-t lg:border-t-0 lg:border-l border-gray-200 pt-3 lg:pt-0 lg:pl-4 min-w-0 flex-shrink-0">
-                      <div className="text-xs sm:text-sm text-gray-500 mb-1 sm:mb-2">
-                        <span className="font-medium">Purchase Date:</span> {new Date(purchase.purchaseDate || purchase.createdAt).toLocaleDateString()}
-                      </div>
-                      <div className="text-xs text-gray-400 mb-2">
-                        <span className="font-medium">Status:</span> {purchase.status}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </motion.div>
-            ))}
-          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              // List View (existing grid/list view)
+              <div className={viewMode === 'grid' ? 'grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-3 sm:gap-4 lg:gap-6' : 'space-y-3 sm:space-y-4'}>
+                {currentPurchases.map((purchase) => {
+                  const firstItem = purchase.items && purchase.items.length > 0 ? purchase.items[0] : null;
+                  const badgeVariantName = firstItem
+                    ? getCanonicalVariantName(firstItem.productId, firstItem.variantId, firstItem.variantName || '')
+                    : '';
+                  const badgeDisplayName = badgeVariantName || 'No Variant';
 
-          {/* Pagination Controls */}
-          {!loading && filteredPurchases.length > 0 && (
+                  return (
+                    <motion.div
+                      key={purchase._id}
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className={`border rounded-lg p-3 sm:p-4 hover:shadow-md transition-all duration-300 ${
+                        newlyAddedPurchaseId === purchase._id
+                          ? 'border-green-500 bg-green-50 shadow-lg ring-2 ring-green-200'
+                          : 'border-gray-200'
+                      }`}
+                    >
+                      <div className="flex flex-col lg:flex-row lg:justify-between lg:items-start gap-3 sm:gap-4">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-2 gap-2">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className="font-semibold text-gray-900 text-sm sm:text-base">{purchase.purchaseNumber}</span>
+                              {firstItem && (
+                                <span className="px-2 py-0.5 sm:py-1 rounded-full text-xs font-medium whitespace-nowrap bg-blue-100 text-blue-800">
+                                  {badgeDisplayName}
+                                </span>
+                              )}
+                              <span className={`px-2 py-0.5 sm:py-1 rounded-full text-xs font-medium whitespace-nowrap ${
+                                purchase.status === 'received' ? 'bg-green-100 text-green-800' :
+                                purchase.status === 'pending' ? 'bg-yellow-100 text-yellow-800' :
+                                'bg-gray-100 text-gray-800'
+                              }`}>
+                                {purchase.status}
+                              </span>
+                              {user?.role === 'admin' && (
+                                <>
+                                  <span className={`px-2 py-0.5 sm:py-1 rounded-full text-xs font-medium whitespace-nowrap ${
+                                    purchase.paymentStatus === 'paid' ? 'bg-green-100 text-green-800' :
+                                    purchase.paymentStatus === 'pending' ? 'bg-yellow-100 text-yellow-800' :
+                                    purchase.paymentStatus === 'partial' ? 'bg-blue-100 text-blue-800' :
+                                    'bg-red-100 text-red-800'
+                                  }`}>
+                                    {purchase.paymentStatus}
+                                  </span>
+                                  {purchase.paymentStatus === 'partial' && purchase.advancePayment > 0 && (
+                                    <div className="text-xs text-gray-600 mt-1">
+                                      <span className="font-medium">Advance:</span> PKR {purchase.advancePayment.toFixed(2)} |
+                                      <span className="font-medium ml-1">Remaining:</span> PKR {(purchase.remainingPayment || 0).toFixed(2)}
+                                    </div>
+                                  )}
+                                </>
+                              )}
+                            </div>
+                            {user?.role === 'admin' && (
+                              <div className="flex items-center gap-1 sm:gap-2">
+                                {!purchase.invoiceGenerated && (
+                                  <button
+                                    onClick={() => handleGenerateInvoice(purchase._id)}
+                                    className="p-2 text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded-lg transition-colors duration-200"
+                                    title="Generate Invoice"
+                                  >
+                                    <FileText className="w-4 h-4" />
+                                  </button>
+                                )}
+                                {purchase.invoiceGenerated && (
+                                  <div className="flex items-center space-x-1">
+                                    <button
+                                      onClick={() => handleDownloadDocument(purchase._id, 'invoice', 'pdf')}
+                                      className="p-2 text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded-lg transition-colors duration-200"
+                                      title="Download Invoice (PDF)"
+                                    >
+                                      <FileText className="w-4 h-4" />
+                                    </button>
+                                    <span className="text-xs text-green-600 font-medium">INV</span>
+                                  </div>
+                                )}
+                                {purchase.paymentStatus !== 'paid' && (
+                                  <button
+                                    onClick={() => handleMarkPaymentCleared(purchase._id)}
+                                    className="p-2 text-green-600 hover:text-green-800 hover:bg-green-50 rounded-lg transition-colors duration-200"
+                                    title="Mark Payment Cleared"
+                                  >
+                                    <CheckCircle className="w-4 h-4" />
+                                  </button>
+                                )}
+                                {purchase.receiptGenerated && (
+                                  <div className="flex items-center space-x-1">
+                                    <button
+                                      onClick={() => handleDownloadDocument(purchase._id, 'receipt', 'pdf')}
+                                      className="p-2 text-green-600 hover:text-green-800 hover:bg-green-50 rounded-lg transition-colors duration-200"
+                                      title="Download Receipt (PDF)"
+                                    >
+                                      <Receipt className="w-4 h-4" />
+                                    </button>
+                                    <span className="text-xs text-green-600 font-medium">REC</span>
+                                  </div>
+                                )}
+                                {purchase.paymentStatus === 'paid' && !purchase.receiptGenerated && (
+                                  <div className="flex items-center space-x-1 text-green-600">
+                                    <CheckCircle className="w-4 h-4" />
+                                    <span className="text-xs font-medium">PAID</span>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                          <div className="mt-2 sm:mt-3">
+                            <p className="text-xs sm:text-sm text-gray-500 mb-1 sm:mb-2">Items:</p>
+                            <div className="flex flex-wrap gap-1.5 sm:gap-2">
+                              {purchase.items.slice(0, 3).map((item, index) => {
+                                const canonicalProductName = getCanonicalProductName(item.productId, item.productId?.name || item.productName || 'Unknown Product');
+                                const canonicalVariantName = getCanonicalVariantName(item.productId, item.variantId, item.variantName);
+                                const displayName = canonicalVariantName
+                                  ? `${canonicalProductName} - ${canonicalVariantName}`
+                                  : canonicalProductName;
+
+                                return (
+                                  <span
+                                    key={index}
+                                    className="px-2 py-0.5 sm:py-1 bg-blue-100 text-blue-800 rounded-full text-xs truncate max-w-[200px]"
+                                    title={`${displayName} (x${item.quantity})`}
+                                  >
+                                    {displayName} (x{item.quantity})
+                                  </span>
+                                );
+                              })}
+                              {purchase.items.length > 3 && (
+                                <span className="px-2 py-0.5 sm:py-1 bg-gray-100 text-gray-600 rounded-full text-xs whitespace-nowrap">
+                                  +{purchase.items.length - 3} more
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                        {user?.role === 'admin' ? (
+                          <div className="lg:text-right border-t lg:border-t-0 lg:border-l border-gray-200 pt-3 lg:pt-0 lg:pl-4 min-w-0 flex-shrink-0">
+                            <div className="text-xs sm:text-sm text-gray-500 mb-1 sm:mb-2">
+                              <span className="font-medium">Supplier:</span> {purchase.supplierId?.name || 'Unknown'}
+                            </div>
+                            <div className="text-xs text-gray-400 mb-2">
+                              {purchase.receivedDate ? `Received: ${new Date(purchase.receivedDate).toLocaleDateString()}` : 'Not received yet'}
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="lg:text-right border-t lg:border-t-0 lg:border-l border-gray-200 pt-3 lg:pt-0 lg:pl-4 min-w-0 flex-shrink-0">
+                            <div className="text-xs sm:text-sm text-gray-500 mb-1 sm:mb-2">
+                              <span className="font-medium">Purchase Date:</span> {new Date(purchase.purchaseDate || purchase.createdAt).toLocaleDateString()}
+                            </div>
+                            <div className="text-xs text-gray-400 mb-2">
+                              <span className="font-medium">Status:</span> {purchase.status}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </motion.div>
+                  );
+                })}
+              </div>
+            )}
+
+          {/* Pagination Controls - Only show when not "All Time" and not searching */}
+          {showPagination && totalPages > 1 && !loading && filteredPurchases.length > 0 && (
             <div className="mt-6 flex items-center justify-between border-t border-gray-200 bg-white px-4 py-3 sm:px-6 rounded-lg">
               <div className="flex flex-1 justify-between sm:hidden">
                 <button

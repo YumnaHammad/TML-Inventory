@@ -1,18 +1,29 @@
 import React, { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { ShoppingCart, Plus, Minus, Trash2, Save, ArrowLeft, Loader2, AlertCircle, CheckCircle } from 'lucide-react';
 import toast from 'react-hot-toast';
 import api from '../../services/api';
+import { useAuth } from '../../contexts/AuthContext';
 
 const SalesFormPage = ({ onSuccess }) => {
   const navigate = useNavigate();
+  const { id } = useParams();
+  const { user } = useAuth();
   const [loading, setLoading] = useState(false);
   const [products, setProducts] = useState([]);
+  const [isEditing, setIsEditing] = useState(false);
+  const [originalStatus, setOriginalStatus] = useState(null);
+  
+  // Get current timestamp
+  const getCurrentTimestamp = () => {
+    return new Date().toISOString();
+  };
+  
   const [formData, setFormData] = useState({
     customerInfo: {
       name: '',
-      email: '',
+      cnNumber: '',
       phone: '',
       address: {
         street: '',
@@ -25,97 +36,211 @@ const SalesFormPage = ({ onSuccess }) => {
     deliveryAddress: {
       street: '',
       city: '',
-      state: '',
-      zipCode: '',
       country: ''
     },
-    expectedDeliveryDate: '',
+    agentName: '',
+    timestamp: getCurrentTimestamp(),
     notes: '',
-    items: []
+    items: [],
+    status: 'pending'
   });
   const [validationErrors, setValidationErrors] = useState({});
   const [stockChecks, setStockChecks] = useState({});
 
   useEffect(() => {
     fetchProducts();
-  }, []);
+    if (id) {
+      fetchSalesOrder(id);
+    }
+  }, [id]);
+
+  // Fetch existing sales order for editing
+  const fetchSalesOrder = async (saleId) => {
+    try {
+      setLoading(true);
+      const response = await api.get(`/sales/${saleId}`);
+      const sale = response.data;
+      
+      setIsEditing(true);
+      setOriginalStatus(sale.status);
+      
+      // Populate form with existing data
+      setFormData({
+        customerInfo: {
+          name: sale.customerInfo?.name || sale.customerName || '',
+          cnNumber: sale.customerInfo?.cnNumber || sale.customerCnNumber || '',
+          phone: sale.customerInfo?.phone || sale.customerPhone || '',
+          address: sale.customerInfo?.address || {}
+        },
+        deliveryAddress: sale.deliveryAddress || {
+          street: '',
+          city: '',
+          country: ''
+        },
+        agentName: sale.agentName || '',
+        timestamp: sale.timestamp || getCurrentTimestamp(),
+        notes: sale.notes || '',
+        items: sale.items?.map(item => ({
+          productId: item.productId?._id || item.productId || '',
+          variantId: item.variantId || '',
+          quantity: item.quantity || 1,
+          unitPrice: item.unitPrice || 0,
+          totalPrice: item.totalPrice || (item.quantity * item.unitPrice)
+        })) || [],
+        status: sale.status || 'pending'
+      });
+    } catch (error) {
+      console.error('Error fetching sales order:', error);
+      toast.error('Failed to load sales order');
+      navigate('/sales');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Update timestamp when user is available (but don't auto-populate agent name)
+  useEffect(() => {
+    if (user && !isEditing) {
+      setFormData(prev => ({
+        ...prev,
+        timestamp: new Date().toISOString()
+      }));
+    }
+  }, [user, isEditing]);
 
   const fetchProducts = async () => {
     try {
-      // Fetch ALL products first
+      // Fetch ALL products first (including inactive ones)
       const productsResponse = await api.get('/products');
       const allProducts = productsResponse.data.products || [];
+      
+      // Debug: Log all product names to help identify missing products
+      console.log('All products fetched:', allProducts.map(p => p.name));
       
       // Fetch warehouses to get ACTUAL purchased stock (with variants)
       const warehousesResponse = await api.get('/warehouses');
       const warehouses = warehousesResponse.data || [];
       
       // Track which product+variant combinations have stock
+      const normalizeKey = (value) => {
+        if (!value) return '';
+        return String(value).toLowerCase().trim().replace(/\s+/g, ' ');
+      };
+
+      const productByIdMap = new Map(
+        allProducts.map(product => [product._id ? product._id.toString() : '', product])
+      );
+
       const variantStockMap = new Map(); // Key: "productId-variantId", Value: available quantity
-      const variantStockByNameMap = new Map(); // Key: "productName-variantName", Value: available quantity
-      
+      const variantStockByNameMap = new Map(); // Key: "normalizedProductName-normalizedVariantName", Value: available quantity
+      const productStockMap = new Map(); // Key: "productId", Value: available quantity
+      const productStockByNameMap = new Map(); // Key: "normalizedProductName", Value: available quantity
+
       warehouses.forEach(warehouse => {
-        if (warehouse.currentStock && Array.isArray(warehouse.currentStock)) {
-          warehouse.currentStock.forEach(stockItem => {
-            const totalStock = (stockItem.quantity || 0);
-            const reserved = (stockItem.reservedQuantity || 0);
-            const delivered = (stockItem.deliveredQuantity || 0);
-            const available = totalStock - reserved - delivered;
-            
-            // Only include items that have available stock
-            if (available > 0) {
-              const productId = stockItem.productId?._id || stockItem.productId;
-              const variantId = stockItem.variantId || 'no-variant';
-              const productName = stockItem.productId?.name || 'Unknown Product';
-              const variantName = stockItem.variantDetails?.name || stockItem.variantName || 'no-variant';
-              
-              if (productId) {
-                // Keep both key formats for compatibility
-                const idKey = `${productId}-${variantId}`;
-                const nameKey = `${productName}-${variantName}`;
-                
-                const currentStockById = variantStockMap.get(idKey) || 0;
-                variantStockMap.set(idKey, currentStockById + available);
-                
-                const currentStockByName = variantStockByNameMap.get(nameKey) || 0;
-                variantStockByNameMap.set(nameKey, currentStockByName + available);
-              }
+        if (!Array.isArray(warehouse.currentStock)) return;
+
+        warehouse.currentStock.forEach(stockItem => {
+          const totalStock = stockItem.quantity || 0;
+          const reserved = stockItem.reservedQuantity || 0;
+          const delivered = stockItem.deliveredQuantity || 0;
+          const confirmedDelivered = stockItem.confirmedDeliveredQuantity || 0;
+          const available = Math.max(0, totalStock - reserved - delivered - confirmedDelivered);
+
+          const rawProductId = stockItem.productId?._id || stockItem.productId;
+          const productId = rawProductId ? rawProductId.toString() : '';
+          const rawVariantId = stockItem.variantId || 'no-variant';
+          const variantId = rawVariantId.toString();
+
+          const productRecord = productByIdMap.get(productId);
+          const productName = productRecord?.name || stockItem.productId?.name || 'Unknown Product';
+
+          let variantName = stockItem.variantDetails?.name || stockItem.variantName || 'no-variant';
+          if (
+            productRecord &&
+            productRecord.hasVariants &&
+            Array.isArray(productRecord.variants) &&
+            variantId !== 'no-variant'
+          ) {
+            const matchedVariant = productRecord.variants.find(
+              (v) => (v._id && v._id.toString() === variantId) || (v.sku && v.sku.toString() === variantId)
+            );
+            if (matchedVariant?.name) {
+              variantName = matchedVariant.name;
             }
+          }
+
+          if (productId) {
+            const idKey = `${productId}-${variantId}`;
+            variantStockMap.set(idKey, (variantStockMap.get(idKey) || 0) + available);
+            productStockMap.set(productId, (productStockMap.get(productId) || 0) + available);
+          }
+
+          const normalizedProductName = normalizeKey(productName);
+          const normalizedVariantName = normalizeKey(variantName);
+
+          const nameKey = `${normalizedProductName}-${normalizedVariantName}`;
+          variantStockByNameMap.set(nameKey, (variantStockByNameMap.get(nameKey) || 0) + available);
+
+          if (productName) {
+            productStockByNameMap.set(
+              normalizedProductName,
+              (productStockByNameMap.get(normalizedProductName) || 0) + available
+            );
+          }
+        });
+      });
+
+      // Show all products, but mark stock availability for each variant/product
+      const productsWithStockInfo = allProducts.map(product => {
+        const productIdStr = product._id ? product._id.toString() : '';
+        const normalizedProductName = normalizeKey(product.name);
+
+        if (product.hasVariants && product.variants && product.variants.length > 0) {
+          const variantsWithStockInfo = product.variants.map(variant => {
+            const rawVariantId = variant._id || variant.sku || 'no-variant';
+            const variantIdStr = rawVariantId.toString();
+            const variantKey = `${productIdStr}-${variantIdStr}`;
+            const nameKey = `${normalizedProductName}-${normalizeKey(variant.name)}`;
+            const availableStock = variantStockMap.get(variantKey) ?? variantStockByNameMap.get(nameKey) ?? 0;
+
+            return {
+              ...variant,
+              availableStock
+            };
           });
+
+          const productAvailableStock = productStockMap.get(productIdStr) ?? productStockByNameMap.get(normalizedProductName) ?? 0;
+
+          return {
+            ...product,
+            variants: variantsWithStockInfo,
+            availableStock: productAvailableStock
+          };
+        } else {
+          const productAvailableStock = productStockMap.get(productIdStr) ?? productStockByNameMap.get(normalizedProductName) ?? 0;
+
+          return {
+            ...product,
+            availableStock: productAvailableStock
+          };
         }
       });
       
-      // Filter products and their variants based on actual stock
-      const purchasedProducts = allProducts.map(product => {
-        if (product.hasVariants && product.variants && product.variants.length > 0) {
-          // Filter variants to only show those with stock
-          const variantsWithStock = product.variants.filter(variant => {
-            const key = `${product._id}-${variant._id || variant.sku}`;
-            return variantStockMap.has(key) && variantStockMap.get(key) > 0;
-          });
-          
-          // Only include product if it has variants with stock
-          if (variantsWithStock.length > 0) {
-            return {
-              ...product,
-              variants: variantsWithStock // ONLY purchased variants
-            };
-          }
-          return null;
-        } else {
-          // No variants - check if product itself has stock
-          const key = `${product._id}-no-variant`;
-          if (variantStockMap.has(key) && variantStockMap.get(key) > 0) {
-            return product;
-          }
-          return null;
+      setProducts(productsWithStockInfo);
+      
+      // Debug: Log products that will be shown in dropdown
+      console.log('Products in dropdown:', productsWithStockInfo.map(p => `${p.name} (Stock: ${p.availableStock || 0})`));
+      
+      // Show info if no products have stock, but still allow selection
+      const productsWithStock = productsWithStockInfo.filter(product => {
+        if (product.hasVariants && product.variants) {
+          return product.variants.some(v => (v.availableStock || 0) > 0);
         }
-      }).filter(Boolean); // Remove nulls
+        return (product.availableStock || 0) > 0;
+      });
       
-      setProducts(purchasedProducts);
-      
-      if (purchasedProducts.length === 0) {
-        toast.info('No products in stock. Please purchase products first.', {
+      if (productsWithStock.length === 0 && productsWithStockInfo.length > 0) {
+        toast.info('No products currently in stock, but you can still create orders.', {
           duration: 4000,
           icon: '📦'
         });
@@ -259,6 +384,24 @@ const SalesFormPage = ({ onSuccess }) => {
       const variant = product?.variants?.find(v => (v._id || v.sku) === variantId);
       const variantName = variant?.name || 'no-variant';
       
+      // Normalize names for flexible matching (lowercase, trim, remove extra spaces)
+      const normalizeName = (name) => {
+        if (!name || name === 'no-variant' || name === 'Unknown Product') return name;
+        return name.toLowerCase().trim().replace(/\s+/g, ' ');
+      };
+      
+      const normalizedProductName = normalizeName(productName);
+      const normalizedVariantName = normalizeName(variantName);
+      
+      // Debug logging
+      console.log('Checking stock for:', {
+        productId: item.productId,
+        productName: productName,
+        variantId: variantId,
+        variantName: variantName,
+        quantity: item.quantity
+      });
+      
       warehouses.forEach(warehouse => {
         if (warehouse.currentStock && Array.isArray(warehouse.currentStock)) {
           warehouse.currentStock.forEach(stockItem => {
@@ -267,20 +410,72 @@ const SalesFormPage = ({ onSuccess }) => {
             const stockProductName = stockItem.productId?.name || 'Unknown Product';
             const stockVariantName = stockItem.variantDetails?.name || stockItem.variantName || 'no-variant';
             
-            // Match by both ID and name for better accuracy
-            const idMatch = stockProductId === item.productId && stockVariantId === variantId;
-            const nameMatch = stockProductName === productName && stockVariantName === variantName;
+            // Normalize warehouse stock names
+            const normalizedStockProductName = normalizeName(stockProductName);
+            const normalizedStockVariantName = normalizeName(stockVariantName);
             
-            if (idMatch || nameMatch) {
+            // Match by ID (exact)
+            const idMatch = stockProductId && item.productId && 
+                          stockProductId.toString() === item.productId.toString() && 
+                          stockVariantId === variantId;
+            
+            // Match by normalized names (flexible)
+            const nameMatch = normalizedProductName !== 'unknown product' &&
+                            normalizedStockProductName !== 'unknown product' &&
+                            normalizedProductName === normalizedStockProductName &&
+                            (normalizedVariantName === normalizedStockVariantName || 
+                             normalizedVariantName === 'no-variant' && normalizedStockVariantName === 'no-variant');
+            
+            // Also try partial matching for variant names (e.g., "maroon" matches "maroon - PKF")
+            const variantPartialMatch = normalizedVariantName !== 'no-variant' &&
+                                       normalizedStockVariantName !== 'no-variant' &&
+                                       (normalizedStockVariantName.includes(normalizedVariantName) ||
+                                        normalizedVariantName.includes(normalizedStockVariantName));
+            
+            // Flexible product name matching (handles "Capri bag pac" vs "Capri bag pack of 4")
+            const productNameExactMatch = normalizedProductName !== 'unknown product' &&
+                                         normalizedStockProductName !== 'unknown product' &&
+                                         normalizedProductName === normalizedStockProductName;
+            
+            // Partial product name match (e.g., "capri bag pac" matches "capri bag pack of 4")
+            const productNamePartialMatch = normalizedProductName !== 'unknown product' &&
+                                          normalizedStockProductName !== 'unknown product' &&
+                                          (normalizedStockProductName.includes(normalizedProductName) ||
+                                           normalizedProductName.includes(normalizedStockProductName));
+            
+            const productNameMatch = productNameExactMatch || productNamePartialMatch;
+            const flexibleNameMatch = productNameMatch && (nameMatch || variantPartialMatch);
+            
+            if (idMatch || flexibleNameMatch) {
               const totalStock = (stockItem.quantity || 0);
               const reserved = (stockItem.reservedQuantity || 0);
               const delivered = (stockItem.deliveredQuantity || 0);
               const confirmedDelivered = (stockItem.confirmedDeliveredQuantity || 0);
               const available = totalStock - reserved - delivered - confirmedDelivered;
+              
+              console.log('Stock match found:', {
+                warehouse: warehouse.name,
+                productName: stockProductName,
+                variantName: stockVariantName,
+                totalStock,
+                reserved,
+                delivered,
+                confirmedDelivered,
+                available
+              });
+              
               totalAvailableStock += Math.max(0, available);
             }
           });
         }
+      });
+
+      console.log('Stock check result:', {
+        productName: productName,
+        variantName: variantName,
+        totalAvailableStock,
+        required: item.quantity,
+        sufficient: totalAvailableStock >= item.quantity
       });
 
       setStockChecks(prev => ({
@@ -303,13 +498,14 @@ const SalesFormPage = ({ onSuccess }) => {
     if (!formData.customerInfo.name) {
       errors['customerInfo.name'] = 'Customer name is required';
     }
-    if (!formData.customerInfo.email) {
-      errors['customerInfo.email'] = 'Customer email is required';
-    } else if (!/\S+@\S+\.\S+/.test(formData.customerInfo.email)) {
-      errors['customerInfo.email'] = 'Customer email is invalid';
+    // CN number is optional, but if provided, must be exactly 14 alphanumeric characters
+    if (formData.customerInfo.cnNumber && !/^[A-Za-z0-9]{14}$/.test(formData.customerInfo.cnNumber)) {
+      errors['customerInfo.cnNumber'] = 'CN number must be exactly 14 alphanumeric characters';
     }
     if (!formData.customerInfo.phone) {
       errors['customerInfo.phone'] = 'Customer phone is required';
+    } else if (!/^0\d{3}-\d{7}$/.test(formData.customerInfo.phone)) {
+      errors['customerInfo.phone'] = 'Phone number must be in format 0XXX-XXXXXXX ';
     }
 
     // Delivery address validation
@@ -345,12 +541,8 @@ const SalesFormPage = ({ onSuccess }) => {
         errors[`item_${index}_unitPrice`] = 'Unit price must be greater than 0';
       }
 
-      // Check stock availability
-      const variantId = item.variantId || 'no-variant';
-      const stockCheck = stockChecks[`${item.productId}-${variantId}`];
-      if (stockCheck && !stockCheck.sufficient) {
-        errors[`item_${index}_stock`] = `Insufficient stock. Available: ${stockCheck.available}, Required: ${stockCheck.required}`;
-      }
+      // Note: Stock validation removed - allowing out-of-stock orders
+      // Stock availability is shown as a warning but doesn't block submission
     });
 
     setValidationErrors(errors);
@@ -371,34 +563,83 @@ const SalesFormPage = ({ onSuccess }) => {
 
     setLoading(true);
     try {
+      // Update timestamp to current time before submitting
+      const currentTimestamp = new Date().toISOString();
+      
+      // Check for out-of-stock items and mark them
+      const itemsWithStockStatus = formData.items.map(item => {
+        const variantId = item.variantId || 'no-variant';
+        const stockCheck = stockChecks[`${item.productId}-${variantId}`];
+        const isOutOfStock = stockCheck && !stockCheck.sufficient;
+        
+        return {
+          ...item,
+          isOutOfStock: isOutOfStock || false
+        };
+      });
+
       // Transform the data to include customerName at the top level
       const salesData = {
         ...formData,
+        items: itemsWithStockStatus,
         customerName: formData.customerInfo.name,
-        customerEmail: formData.customerInfo.email,
-        customerPhone: formData.customerInfo.phone
+        customerCnNumber: formData.customerInfo.cnNumber,
+        customerPhone: formData.customerInfo.phone,
+        agentName: formData.agentName || '',
+        timestamp: currentTimestamp,
+        hasOutOfStockItems: itemsWithStockStatus.some(item => item.isOutOfStock)
       };
       
-      const response = await api.post('/sales', salesData);
-      const newSale = response.data.salesOrder;
+      // Remove status from update data - status should only be changed via action buttons
+      if (isEditing && id) {
+        delete salesData.status;
+      }
       
-      // Show success message with more details
-      toast.success(`Sales order ${newSale.orderNumber || 'SO-' + newSale._id.slice(-4)} created successfully!`, {
-        duration: 4000,
-        icon: '✅'
-      });
+      let response;
       
-      // Store the new sale in localStorage for immediate access
-      const existingSales = JSON.parse(localStorage.getItem('tempSales') || '[]');
-      existingSales.unshift(newSale);
-      localStorage.setItem('tempSales', JSON.stringify(existingSales));
-      
-      // If onSuccess callback is provided, use it for immediate state update
-      if (onSuccess) {
-        onSuccess(newSale);
-      } else {
+      if (isEditing && id) {
+        // Update existing sales order
+        response = await api.put(`/sales/${id}`, salesData);
+        const updatedSale = response.data.salesOrder;
+        
+        toast.success(`Sales order ${updatedSale.orderNumber || id} updated successfully!`, {
+          duration: 4000,
+          icon: '✅'
+        });
+        
         // Navigate back to sales page
         navigate('/sales');
+      } else {
+        // Create new sales order
+        response = await api.post('/sales', salesData);
+        const newSale = response.data.salesOrder;
+        
+        // Show success message with out-of-stock warning if applicable
+        const hasOutOfStock = itemsWithStockStatus.some(item => item.isOutOfStock);
+        if (hasOutOfStock) {
+          toast.success(`Sales order ${newSale.orderNumber || 'SO-' + newSale._id.slice(-4)} created successfully! ⚠ Contains out-of-stock items (backorder).`, {
+            duration: 5000,
+            icon: '✅'
+          });
+        } else {
+          toast.success(`Sales order ${newSale.orderNumber || 'SO-' + newSale._id.slice(-4)} created successfully!`, {
+            duration: 4000,
+            icon: '✅'
+          });
+        }
+        
+        // Store the new sale in localStorage for immediate access
+        const existingSales = JSON.parse(localStorage.getItem('tempSales') || '[]');
+        existingSales.unshift(newSale);
+        localStorage.setItem('tempSales', JSON.stringify(existingSales));
+        
+        // If onSuccess callback is provided, use it for immediate state update
+        if (onSuccess) {
+          onSuccess(newSale);
+        } else {
+          // Navigate back to sales page
+          navigate('/sales');
+        }
       }
     } catch (error) {
       // Show detailed error message from backend
@@ -448,8 +689,8 @@ const SalesFormPage = ({ onSuccess }) => {
               <ShoppingCart className="w-6 h-6 text-white" />
             </div>
             <div>
-              <h1 className="text-2xl font-bold text-gray-900">Create Sales Order</h1>
-              <p className="text-gray-600">Create new sales order for customer</p>
+              <h1 className="text-2xl font-bold text-gray-900">{isEditing ? 'Edit Sales Order' : 'Create Sales Order'}</h1>
+              <p className="text-gray-600">{isEditing ? 'Update sales order details' : 'Create new sales order for customer'}</p>
             </div>
           </div>
         </div>
@@ -488,22 +729,27 @@ const SalesFormPage = ({ onSuccess }) => {
 
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Email *
+                  CN Number
                 </label>
                 <input
-                  type="email"
-                  name="customerInfo.email"
-                  value={formData.customerInfo.email}
-                  onChange={handleChange}
+                  type="text"
+                  name="customerInfo.cnNumber"
+                  value={formData.customerInfo.cnNumber}
+                  onChange={(e) => {
+                    // Only allow alphanumeric characters and limit to 14 characters
+                    const value = e.target.value.replace(/[^A-Za-z0-9]/g, '').slice(0, 14);
+                    handleChange({ target: { name: 'customerInfo.cnNumber', value } });
+                  }}
                   className={`w-full px-4 py-3 border rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent ${
-                    validationErrors['customerInfo.email'] ? 'border-red-500' : 'border-gray-300'
+                    validationErrors['customerInfo.cnNumber'] ? 'border-red-500' : 'border-gray-300'
                   }`}
-                  placeholder="customer@example.com"
+                  placeholder="26393050000620"
+                  maxLength={14}
                 />
-                {validationErrors['customerInfo.email'] && (
+                {validationErrors['customerInfo.cnNumber'] && (
                   <p className="mt-1 text-sm text-red-600 flex items-center">
                     <AlertCircle className="w-4 h-4 mr-1" />
-                    {validationErrors['customerInfo.email']}
+                    {validationErrors['customerInfo.cnNumber']}
                   </p>
                 )}
       </div>
@@ -516,11 +762,34 @@ const SalesFormPage = ({ onSuccess }) => {
                   type="tel"
                   name="customerInfo.phone"
                   value={formData.customerInfo.phone}
-                  onChange={handleChange}
+                  onChange={(e) => {
+                    let value = e.target.value.replace(/[^0-9-]/g, ''); // Allow digits and dash
+                    // Remove dash if user is deleting
+                    const digits = value.replace(/-/g, '');
+                    
+                    // Format as 0XXX-XXXXXXX
+                    if (digits.length > 0) {
+                      // Ensure starts with 0
+                      if (digits[0] !== '0') {
+                        value = '0' + digits.slice(0, 10);
+                      } else {
+                        value = digits.slice(0, 11);
+                      }
+                      // Add dash after 4th digit if we have more than 4 digits
+                      if (value.length > 4) {
+                        value = value.slice(0, 4) + '-' + value.slice(4, 11);
+                      }
+                    } else {
+                      value = '';
+                    }
+                    
+                    handleChange({ target: { name: 'customerInfo.phone', value } });
+                  }}
                   className={`w-full px-4 py-3 border rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent ${
                     validationErrors['customerInfo.phone'] ? 'border-red-500' : 'border-gray-300'
                   }`}
-                  placeholder="+1 (555) 123-4567"
+                  placeholder="xxxx-xxxxxxx"
+                  maxLength={12}
                 />
                 {validationErrors['customerInfo.phone'] && (
                   <p className="mt-1 text-sm text-red-600 flex items-center">
@@ -552,18 +821,51 @@ const SalesFormPage = ({ onSuccess }) => {
                 )}
               </div>
 
-          <div>
+              <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Expected Delivery Date
+                  Agent Name
                 </label>
                 <input
-                  type="date"
-                  name="expectedDeliveryDate"
-                  value={formData.expectedDeliveryDate}
+                  type="text"
+                  name="agentName"
+                  value={formData.agentName}
                   onChange={handleChange}
                   className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+                  placeholder="Enter agent name"
                 />
               </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Timestamp
+                </label>
+                <input
+                  type="text"
+                  name="timestamp"
+                  value={new Date(formData.timestamp).toLocaleString()}
+                  readOnly
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg bg-gray-50 text-gray-600 cursor-not-allowed"
+                />
+              </div>
+
+              {/* Status field - only shown when editing (read-only) */}
+              {isEditing && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Status
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.status ? formData.status.charAt(0).toUpperCase() + formData.status.slice(1).replace('_', ' ') : 'Pending'}
+                    readOnly
+                    disabled
+                    className="w-full px-4 py-3 border border-gray-300 rounded-lg bg-gray-50 text-gray-600 cursor-not-allowed"
+                  />
+                  <p className="mt-1 text-xs text-gray-500">
+                    Status cannot be changed here. Use the action buttons in the sales list to update status.
+                  </p>
+                </div>
+              )}
             </div>
           </div>
 
@@ -615,34 +917,6 @@ const SalesFormPage = ({ onSuccess }) => {
                 )}
               </div>
 
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  State
-                </label>
-                <input
-                  type="text"
-                  name="deliveryAddress.state"
-                  value={formData.deliveryAddress.state}
-                  onChange={handleChange}
-                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
-                  placeholder="NY"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  ZIP Code
-                </label>
-                <input
-                  type="text"
-                  name="deliveryAddress.zipCode"
-                  value={formData.deliveryAddress.zipCode}
-                  onChange={handleChange}
-                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
-                  placeholder="10001"
-                />
-              </div>
-
           <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">
                   Country
@@ -658,6 +932,26 @@ const SalesFormPage = ({ onSuccess }) => {
               </div>
           </div>
         </div>
+
+          {/* Out of Stock Warning Banner */}
+          {(() => {
+            const hasOutOfStockItems = formData.items.some(item => {
+              const variantId = item.variantId || 'no-variant';
+              const stockCheck = stockChecks[`${item.productId}-${variantId}`];
+              return stockCheck && !stockCheck.sufficient;
+            });
+            
+            return hasOutOfStockItems && (
+              <div className="card p-4 mb-6 bg-orange-50 border-2 border-orange-300">
+                <div className="flex items-center space-x-2">
+                  <AlertCircle className="w-5 h-5 text-orange-600" />
+                  <p className="text-sm font-semibold text-orange-800">
+                    ⚠ Warning: This order contains out-of-stock items. The order will be created as a backorder and marked accordingly.
+                  </p>
+                </div>
+              </div>
+            );
+          })()}
 
           {/* Sales Items */}
           <div className="card p-6">
@@ -715,11 +1009,16 @@ const SalesFormPage = ({ onSuccess }) => {
                           }`}
                         >
                           <option value="">Select Product</option>
-                          {products.map(product => (
-                            <option key={product._id} value={product._id}>
-                              {product.name} ({product.sku})
-                            </option>
-                          ))}
+                          {products.map(product => {
+                            const stockInfo = product.hasVariants 
+                              ? '' // Variants will show their own stock
+                              : ` - Stock: ${product.availableStock || 0}`;
+                            return (
+                              <option key={product._id} value={product._id}>
+                                {product.name} ({product.sku}){stockInfo}
+                              </option>
+                            );
+                          })}
                         </select>
                         {validationErrors[`item_${index}_productId`] && (
                           <p className="mt-1 text-sm text-red-600">
@@ -742,11 +1041,16 @@ const SalesFormPage = ({ onSuccess }) => {
                             }`}
                           >
                             <option value="">Select Variant</option>
-                            {getProductVariants(item.productId).map(variant => (
+                            {getProductVariants(item.productId).map(variant => {
+                              const stockInfo = variant.availableStock !== undefined 
+                                ? ` - Stock: ${variant.availableStock || 0}` 
+                                : '';
+                              return (
                               <option key={variant._id || variant.sku} value={variant._id || variant.sku}>
-                                {variant.name} - PKR {variant.sellingPrice}
+                                {variant.name} - PKR {variant.sellingPrice}{stockInfo}
                               </option>
-                            ))}
+                              );
+                            })}
                           </select>
                           {validationErrors[`item_${index}_variantId`] && (
                             <p className="mt-1 text-sm text-red-600">
@@ -782,12 +1086,17 @@ const SalesFormPage = ({ onSuccess }) => {
                               {stockCheck.sufficient ? (
                                 <p className="text-sm text-green-600 flex items-center">
                                   <CheckCircle className="w-3 h-3 mr-1" />
-                                  Stock available: {stockCheck.available}
+                                  ✔ Stock available: {stockCheck.available}
+                                </p>
+                              ) : stockCheck.available === 0 ? (
+                                <p className="text-sm text-red-600 flex items-center font-semibold">
+                                  <AlertCircle className="w-4 h-4 mr-1" />
+                                  ⚠ OUT OF STOCK - Order will be created as backorder
                                 </p>
                               ) : (
-                                <p className="text-sm text-red-600 flex items-center">
-                                  <AlertCircle className="w-3 h-3 mr-1" />
-                                  Low stock: {stockCheck.available} available
+                                <p className="text-sm text-orange-600 flex items-center font-semibold">
+                                  <AlertCircle className="w-4 h-4 mr-1" />
+                                  ⚠ Low stock: {stockCheck.available} available (Required: {stockCheck.required}) - Order will be created as backorder
                                 </p>
                               )}
                             </div>
@@ -821,7 +1130,7 @@ const SalesFormPage = ({ onSuccess }) => {
                           Total Price
                         </label>
                         <div className="px-3 py-2 bg-gray-50 border border-gray-300 rounded-lg">
-                          ${(item.quantity * item.unitPrice).toFixed(2)}
+                          Rs {(item.quantity * item.unitPrice).toFixed(2)}
                         </div>
                       </div>
                     </div>
@@ -852,7 +1161,7 @@ const SalesFormPage = ({ onSuccess }) => {
                   <div className="text-right">
                     <p className="text-sm text-gray-600">Total Amount:</p>
                     <p className="text-2xl font-bold text-primary-600">
-                      ${calculateTotal().toFixed(2)}
+                      Rs {calculateTotal().toFixed(2)}
                     </p>
                   </div>
                 </div>
@@ -877,12 +1186,12 @@ const SalesFormPage = ({ onSuccess }) => {
               {loading ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  <span>Creating...</span>
+                  <span>{isEditing ? 'Updating...' : 'Creating...'}</span>
                 </>
               ) : (
                 <>
                   <Save className="w-4 h-4" />
-                  <span>Create Sales Order</span>
+                  <span>{isEditing ? 'Update Sales Order' : 'Create Sales Order'}</span>
                 </>
               )}
           </button>
