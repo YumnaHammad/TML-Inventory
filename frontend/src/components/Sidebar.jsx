@@ -18,7 +18,8 @@ import {
   UserCheck,
   X,
   MapPin,
-  Users
+  Users,
+  CheckCircle
 } from 'lucide-react';
 
 const Sidebar = ({ isMobileOpen, setIsMobileOpen }) => {
@@ -44,6 +45,8 @@ const Sidebar = ({ isMobileOpen, setIsMobileOpen }) => {
       { name: 'Warehouses', href: '/warehouses', icon: Warehouse },
       { name: 'Purchases', href: '/purchases', icon: ShoppingCart },
       { name: 'Sales', href: '/sales', icon: Truck },
+      { name: 'Approved Sales', href: '/approved-sales', icon: CheckCircle },
+      { name: 'PostEx Orders', href: '/postex-orders', icon: Truck },
       { name: 'Suppliers', href: '/suppliers', icon: Building2 },
       { name: 'Reports', href: '/reports', icon: BarChart3 },
       { name: 'Finance', href: '/finance', icon: DollarSign },
