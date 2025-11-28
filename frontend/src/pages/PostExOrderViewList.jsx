@@ -9,17 +9,7 @@ import {
   RotateCcw,
   Package,
   ArrowLeft,
-  FileText,
-  User,
-  Phone,
-  MapPin,
-  DollarSign,
-  Calendar,
-  Weight,
-  Building2,
-  CreditCard,
-  MessageSquare,
-  History,
+  MessageSquare
 } from "lucide-react";
 import { useNavigate, useParams, useLocation } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
