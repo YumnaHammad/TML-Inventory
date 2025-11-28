@@ -59,19 +59,53 @@ const PostExOrderPage = () => {
     },
   ];
   // update postex status
-  const updatePostExStatus = async (saleId) => {
+  const updatePostExStatus = async (saleId, trackingNumber) => {
     try {
       const response = await axios.post(
         `/api/sales-orders/update-postex-status`,
         {
           postExStatus: true,
           id: saleId,
+          trackingNumber: trackingNumber,
         }
       );
+      await updateWharehuse(saleId, "Unbooked");
       toast.success("PostEx status updated successfully");
       console.log("PostEx status updated:", response.data);
     } catch (error) {
       console.error("Error updating postex status:", error);
+    }
+  };
+
+  const updateWharehuse = async (saleId, newStatus) => {
+    console.log("He tried to run me for updating whsrer house");
+
+    try {
+      const response = await api.patch(`/sales/${saleId}/status`, {
+        status: newStatus,
+      });
+      console.log(
+        "Status updated successfully fro whare house:",
+        response.data
+      );
+    } catch (error) {
+      console.error("Error updating status:", error);
+      console.error("Error details:", {
+        message: error.message,
+        response: error.response?.data,
+        status: error.response?.status,
+        saleId,
+        newStatus,
+      });
+      if (loadingToast) {
+        toast.dismiss(loadingToast);
+      }
+
+      const errorMessage =
+        error.response?.data?.error ||
+        error.message ||
+        "Failed to update status";
+      toast.error(errorMessage);
     }
   };
 
@@ -129,12 +163,13 @@ const PostExOrderPage = () => {
           response.data.statusCode === "200" ||
           response.data.status === "200"
         ) {
-          updatePostExStatus(saleId);
+          console.log("postex response is", response);
+          const trackingNumber = response.data.dist.trackingNumber;
+          updatePostExStatus(saleId, trackingNumber);
           return {
             success: true,
             data: response.data,
-            trackingNumber:
-              response.data.trackingNumber || response.data.orderId,
+            trackingNumber: response.data.dist.trackingNumber,
             orderId: response.data.orderId,
           };
         } else {
@@ -218,6 +253,7 @@ const PostExOrderPage = () => {
             deliveryAddress: sale.deliveryAddress?.street || "",
             items: sale.items?.length?.toString() || "1",
             notes: sale.notes || "",
+            bookingWeight: 0.5,
           }));
         } catch (error) {
           console.error("Error fetching sale data:", error);
@@ -535,19 +571,16 @@ const PostExOrderPage = () => {
                 <label className="block text-sm font-medium text-gray-700 mb-2">
                   Delivery City <span className="text-red-500">*</span>
                 </label>
-                <select
+
+                <input
+                  type="text"
                   name="deliveryCity"
                   value={postExFormData.deliveryCity}
                   onChange={handlePostExFormChange}
+                  placeholder="Enter Delivery City"
                   className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                   required
-                >
-                  <option value="">Select City</option>
-                  <option value="Rawalpindi">Rawalpindi</option>
-                  <option value="Islamabad">Islamabad</option>
-                  <option value="Karachi">Karachi</option>
-                  <option value="Lahore">Lahore</option>
-                </select>
+                />
               </div>
 
               <div className="md:col-span-2">

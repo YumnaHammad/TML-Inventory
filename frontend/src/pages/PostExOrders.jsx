@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { motion } from "framer-motion";
 import axios from "axios";
 import {
@@ -23,6 +23,7 @@ import {
   MessageSquare,
   Edit,
   RotateCcw,
+  Printer,
 } from "lucide-react";
 import CenteredLoader from "../components/CenteredLoader";
 import { useNavigate } from "react-router-dom";
@@ -67,6 +68,8 @@ const PostExOrders = () => {
     deliveredOrders: 0,
   });
   const [openDropdownId, setOpenDropdownId] = useState(null);
+  const [selectedOrders, setSelectedOrders] = useState([]); // Array of tracking numbers
+  const selectAllCheckboxRef = useRef(null);
   const navigate = useNavigate();
   const { user } = useAuth();
 
@@ -138,7 +141,7 @@ const PostExOrders = () => {
   // Map PostEx status to local status format
   const mapPostExStatusToLocal = (postExStatus) => {
     if (!postExStatus) return "pending";
-    
+
     const statusLower = postExStatus.toLowerCase();
     if (
       statusLower.includes("pending") ||
@@ -201,90 +204,31 @@ const PostExOrders = () => {
       if (statusFilter && statusFilter !== "All Orders") {
         // Map filter label to possible PostEx API status values
         const statusMap = {
-          "Unbooked": ["unbooked", "pending", "un-assigned", "unassigned"],
-          "Booked": ["booked", "confirmed", "submitted"],
-          "PostEx WareHouse": ["postex warehouse", "warehouse", "at warehouse", "in warehouse"],
-          "Out For Delivery": ["out for delivery", "out_for_delivery", "outfordelivery"],
-          "Delivered": ["delivered", "delivery completed"],
-          "Returned": ["returned", "return"],
-          "Un-Assigned By Me": ["un-assigned by me", "unassigned by me", "un-assigned"],
-          "Expired": ["expired"],
-          "Delivery Under Review": ["delivery under review", "under review"],
-          "Picked By PostEx": ["picked by postex", "pickedbypostex"],
-          "Out For Return": ["out for return", "out_for_return", "outforreturn"],
-          "Attempted": ["attempted", "attempt"],
-          "En-Route to PostEx warehouse": ["en-route to postex warehouse", "enroute to postex warehouse", "en route to postex warehouse"]
+          Unbooked: "pending",
+          Booked: "submitted",
+          "PostEx WareHouse": "in_transit",
+          "Out For Delivery": "in_transit",
+          Delivered: "delivered",
+          Returned: "cancelled",
+          "Un-Assigned By Me": "pending",
+          Expired: "cancelled",
+          "Delivery Under Review": "pending",
+          "Picked By PostEx": "submitted",
+          "Out For Return": "cancelled",
+          Attempted: "in_transit",
+          "En-Route to PostEx warehouse": "in_transit",
         };
-        
-        const possibleStatuses = statusMap[statusFilter] || [statusFilter.toLowerCase()];
-        const filterLabelLower = statusFilter.toLowerCase();
-        
-        filteredOrders = filteredOrders.filter(
-          (order) => {
-            const orderStatus = (order.status || order.transactionStatus || "").toLowerCase().trim();
-            const orderStatusOriginal = (order.status || order.transactionStatus || "").trim();
-            
-            // Special handling for "Booked" vs "Unbooked" to prevent false matches
-            if (filterLabelLower === "booked") {
-              // For "Booked" filter, explicitly exclude "unbooked" orders first
-              if (orderStatus.includes("unbooked") || 
-                  (orderStatus.startsWith("un-") && orderStatus.includes("booked")) ||
-                  orderStatus.startsWith("unassigned")) {
-                return false;
-              }
-              // Match booked, confirmed, submitted (but not unbooked)
-              if (orderStatus === "booked" || 
-                  orderStatus === "confirmed" || 
-                  orderStatus === "submitted" ||
-                  (orderStatus.includes("booked") && !orderStatus.includes("unbooked") && !orderStatus.startsWith("un-"))) {
-                return true;
-              }
-              return false;
-            }
-            
-            // Special handling for "Unbooked" filter
-            if (filterLabelLower === "unbooked") {
-              // Only match unbooked, pending, un-assigned
-              if (orderStatus === "unbooked" || 
-                  orderStatus === "pending" || 
-                  orderStatus.includes("un-assigned") ||
-                  orderStatus.includes("unassigned")) {
-                // Make sure it's not booked
-                if (orderStatus.includes("booked") && !orderStatus.includes("unbooked")) {
-                  return false;
-                }
-                return true;
-              }
-              return false;
-            }
-            
-            // Direct exact match with filter label (case-insensitive)
-            if (orderStatus === filterLabelLower || orderStatusOriginal === statusFilter) {
-              return true;
-            }
-            
-            // Check against possible status variations
-            for (const possibleStatus of possibleStatuses) {
-              // Exact match
-              if (orderStatus === possibleStatus) {
-                return true;
-              }
-              // Check if order status contains the possible status (but be careful with partial matches)
-              // Use word boundary for better matching
-              const escapedStatus = possibleStatus.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-              const regex = new RegExp(`(^|\\s)${escapedStatus}(\\s|$)`, 'i');
-              if (regex.test(orderStatus)) {
-                return true;
-              }
-              // Also check if order status starts with the possible status
-              if (orderStatus.startsWith(possibleStatus + " ") || orderStatus.startsWith(possibleStatus + "-")) {
-                return true;
-              }
-            }
-            
-            return false;
-          }
-        );
+
+        const mappedStatus =
+          statusMap[statusFilter] || statusFilter.toLowerCase();
+        filteredOrders = filteredOrders.filter((order) => {
+          const orderStatus = order.status?.toLowerCase() || "";
+          return (
+            orderStatus === mappedStatus ||
+            orderStatus.includes(mappedStatus) ||
+            order.status === statusFilter
+          );
+        });
       }
 
       // City filter
@@ -317,7 +261,6 @@ const PostExOrders = () => {
           return orderDate <= endDate;
         });
       }
-
 
       // Update total count
       setTotalOrdersCount(filteredOrders.length);
@@ -376,10 +319,11 @@ const PostExOrders = () => {
         let ordersData = data.dist || [];
         console.log("Orders data from API:", ordersData.length);
 
-      // Map API orders to local format
-        const mappedOrders = ordersData.length > 0 
-          ? ordersData.map(mapPostExOrderToLocalFormat)
-          : [];
+        // Map API orders to local format
+        const mappedOrders =
+          ordersData.length > 0
+            ? ordersData.map(mapPostExOrderToLocalFormat)
+            : [];
         console.log("Mapped orders count:", mappedOrders.length);
 
         // Store all orders
@@ -392,18 +336,14 @@ const PostExOrders = () => {
             (sum, order) => sum + (order.orderAmount || 0),
             0
           ),
-          pendingOrders: mappedOrders.filter(
-            (order) => {
-              const status = order.status?.toLowerCase() || "";
-              return status.includes("pending") || status.includes("unbooked");
-            }
-          ).length,
-          returnedOrders: mappedOrders.filter(
-            (order) => {
-              const status = order.status?.toLowerCase() || "";
-              return status.includes("returned") || status.includes("cancelled");
-            }
-          ).length,
+          pendingOrders: mappedOrders.filter((order) => {
+            const status = order.status?.toLowerCase() || "";
+            return status.includes("pending") || status.includes("unbooked");
+          }).length,
+          returnedOrders: mappedOrders.filter((order) => {
+            const status = order.status?.toLowerCase() || "";
+            return status.includes("returned") || status.includes("cancelled");
+          }).length,
           deliveredOrders: mappedOrders.filter(
             (order) => order.status === "Delivered"
           ).length,
@@ -448,7 +388,7 @@ const PostExOrders = () => {
         console.error("Error message:", error.message);
       }
       console.error("Error config:", error.config);
-      
+
       setOrders([]);
       setTotalOrdersCount(0);
       // Reset summary stats on error
@@ -459,7 +399,7 @@ const PostExOrders = () => {
         returnedOrders: 0,
         deliveredOrders: 0,
       });
-      
+
       let errorMessage = "Failed to load PostEx orders: ";
       if (error.response) {
         errorMessage += `Server responded with status ${error.response.status}`;
@@ -518,13 +458,22 @@ const PostExOrders = () => {
     setOpenDropdownId(null); // Close dropdown after action
   };
 
-  const handleConfirmCancel = async () => {
+  const handleConfirmCancel = async (trackingNumber) => {
     if (!orderToCancel) return;
+    console.log("the traking id to cancel the order is ", trackingNumber);
 
     try {
-      // TODO: Implement actual cancel order API call
-      // Example:
-      // await api.post(`/postex/orders/${orderToCancel._id}/cancel`);
+      const response = await axios.put(
+        "https://api.postex.pk/services/integration/api/order/v1/cancel-order",
+        { trackingNumber },
+        {
+          headers: {
+            token:
+              "ZThkODBkYzg4NjBkNDE0YzgxOWUxZGZkM2U0YjNjYjc6ZDk2ZjE5NjBjNzU2NDk3MThmZDc2MmExYTgyYWY5MmY=",
+          },
+        }
+      );
+      console.log("cacnel response is", response);
 
       toast.success(
         `Order ${orderToCancel.orderReferenceNumber} has been cancelled`
@@ -534,7 +483,7 @@ const PostExOrders = () => {
 
       // Refresh the orders list
       fetchPostExOrders();
-      } catch (error) {
+    } catch (error) {
       console.error("Error cancelling order:", error);
       toast.error("Failed to cancel order. Please try again.");
     }
@@ -555,6 +504,102 @@ const PostExOrders = () => {
     setShowRemarksModal(false);
     setOrderForRemarks(null);
   };
+  const handlePrintInvoice = async (trackingNumber) => {
+    try {
+      const response = await axios.get(
+        "https://api.postex.pk/services/integration/api/order/v1/get-invoice",
+        {
+          responseType: "blob", // PDF blob
+          params: {
+            trackingNumbers: trackingNumber, // <-- your tracking number
+          },
+          headers: {
+            token:
+              "ZThkODBkYzg4NjBkNDE0YzgxOWUxZGZkM2U0YjNjYjc6ZDk2ZjE5NjBjNzU2NDk3MThmZDc2MmExYTgyYWY5MmY=", // <-- your PostEx token
+          },
+        }
+      );
+
+      // Convert Blob to PDF URL
+      const fileURL = URL.createObjectURL(response.data);
+
+      // Open in new tab
+      const newTab = window.open(fileURL);
+
+      // Auto-print when loaded
+      newTab.onload = () => {
+        newTab.print();
+      };
+    } catch (error) {
+      console.error("Error fetching invoice:", error);
+      toast.error("Failed to print invoice");
+    }
+  };
+
+  // Handle bulk print
+  const handleBulkPrint = async () => {
+    if (selectedOrders.length === 0) {
+      toast.error("Please select at least one order to print");
+      return;
+    }
+
+    try {
+      toast.loading(`Printing ${selectedOrders.length} invoice(s)...`);
+      
+      // Print each invoice separately (PostEx API may not support multiple in one call)
+      for (let i = 0; i < selectedOrders.length; i++) {
+        const trackingNumber = selectedOrders[i];
+        await handlePrintInvoice(trackingNumber);
+        
+        // Add a small delay between prints to avoid overwhelming the browser
+        if (i < selectedOrders.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
+      
+      toast.dismiss();
+      toast.success(`Successfully printed ${selectedOrders.length} invoice(s)`);
+      setSelectedOrders([]); // Clear selection after printing
+    } catch (error) {
+      console.error("Error in bulk print:", error);
+      toast.dismiss();
+      toast.error("Failed to print some invoices");
+    }
+  };
+
+  // Handle checkbox selection
+  const handleSelectOrder = (trackingNumber) => {
+    setSelectedOrders(prev => {
+      if (prev.includes(trackingNumber)) {
+        return prev.filter(tn => tn !== trackingNumber);
+      } else {
+        return [...prev, trackingNumber];
+      }
+    });
+  };
+
+  // Handle select all
+  const handleSelectAll = () => {
+    if (selectedOrders.length === orders.length) {
+      setSelectedOrders([]);
+    } else {
+      const allTrackingNumbers = orders
+        .filter(order => order.trackingNumber)
+        .map(order => order.trackingNumber);
+      setSelectedOrders(allTrackingNumbers);
+    }
+  };
+
+  // Check if all orders are selected
+  const allSelected = orders.length > 0 && selectedOrders.length === orders.length;
+  const someSelected = selectedOrders.length > 0 && selectedOrders.length < orders.length;
+
+  // Set indeterminate state for select all checkbox
+  useEffect(() => {
+    if (selectAllCheckboxRef.current) {
+      selectAllCheckboxRef.current.indeterminate = someSelected;
+    }
+  }, [someSelected]);
 
   // Get remarks for an order (sample data - replace with API call)
   const getOrderRemarks = (order) => {
@@ -745,7 +790,7 @@ const PostExOrders = () => {
                 </span>
               </p>
               <p className="text-3xl font-bold">{summaryStats.totalOrders}</p>
-        </div>
+            </div>
             <div className="bg-blue-400 bg-opacity-30 rounded-lg p-3">
               <Package className="w-8 h-8" />
             </div>
@@ -763,7 +808,9 @@ const PostExOrders = () => {
               <p className="text-orange-100 text-sm font-medium mb-1">
                 Returned Orders
               </p>
-              <p className="text-3xl font-bold">{summaryStats.returnedOrders}</p>
+              <p className="text-3xl font-bold">
+                {summaryStats.returnedOrders}
+              </p>
             </div>
             <div className="bg-orange-400 bg-opacity-30 rounded-lg p-3">
               <RotateCcw className="w-8 h-8" />
@@ -820,6 +867,15 @@ const PostExOrders = () => {
             Filters
           </h3>
           <div className="flex items-center gap-2">
+            {selectedOrders.length > 0 && (
+              <button
+                onClick={handleBulkPrint}
+                className="flex items-center px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors shadow-sm"
+              >
+                <Printer className="w-4 h-4 mr-2" />
+                Print Selected ({selectedOrders.length})
+              </button>
+            )}
             <button
               onClick={() => setShowAdvancedFilters(!showAdvancedFilters)}
               className="flex items-center px-3 py-2 text-sm text-gray-700 hover:text-gray-900 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
@@ -863,7 +919,9 @@ const PostExOrders = () => {
               value={statusFilter || "All Orders"}
               onChange={(e) => {
                 e.preventDefault();
-                setStatusFilter(e.target.value === "All Orders" ? "" : e.target.value);
+                setStatusFilter(
+                  e.target.value === "All Orders" ? "" : e.target.value
+                );
                 setCurrentPage(1);
               }}
               className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
@@ -889,7 +947,7 @@ const PostExOrders = () => {
               <option value="Reverse">Reverse</option>
               <option value="Replacement">Replacement</option>
             </select>
-        </div>
+          </div>
         </div>
 
         {/* Advanced Filters */}
@@ -969,6 +1027,15 @@ const PostExOrders = () => {
           <table className="min-w-full divide-y divide-gray-200">
             <thead className="bg-gray-50">
               <tr>
+                <th className="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider w-12">
+                  <input
+                    type="checkbox"
+                    ref={selectAllCheckboxRef}
+                    checked={allSelected}
+                    onChange={handleSelectAll}
+                    className="w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500 focus:ring-2"
+                  />
+                </th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                   S.NO
                 </th>
@@ -1003,6 +1070,9 @@ const PostExOrders = () => {
                 <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                   STATUS
                 </th>
+                <th className="px-4 py-2 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  PRINT
+                </th>
                 <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                   ACTIONS
                 </th>
@@ -1013,7 +1083,7 @@ const PostExOrders = () => {
               {orders.length === 0 ? (
                 <tr>
                   <td
-                    colSpan={13}
+                    colSpan={15}
                     className="px-6 py-8 text-center text-gray-500"
                   >
                     No PostEx orders found.
@@ -1022,6 +1092,15 @@ const PostExOrders = () => {
               ) : (
                 orders.map((order, index) => (
                   <tr key={order._id} className="hover:bg-gray-50">
+                    {/* CHECKBOX */}
+                    <td className="px-6 py-4 whitespace-nowrap text-center">
+                      <input
+                        type="checkbox"
+                        checked={selectedOrders.includes(order.trackingNumber)}
+                        onChange={() => handleSelectOrder(order.trackingNumber)}
+                        className="w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500 focus:ring-2"
+                      />
+                    </td>
                     {/* SERIAL NUMBER */}
                     <td className="px-6 py-4 whitespace-nowrap">
                       <div className="text-sm font-medium text-gray-900">
@@ -1131,6 +1210,19 @@ const PostExOrders = () => {
                           "PENDING"}
                       </span>
                     </td>
+                    {/* PRINT */}
+                    <td className="px-6 py-4 whitespace-nowrap text-center">
+                      <button
+                        onClick={() =>
+                          handlePrintInvoice(order.trackingNumber)
+                        }
+                        className="inline-flex items-center justify-center gap-2 px-3 py-2 text-sm font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-lg border border-blue-200 transition-all duration-200 hover:shadow-sm min-w-[100px]"
+                        title="Print Invoice"
+                      >
+                        <Printer className="w-4 h-4 flex-shrink-0" />
+                        <span>Print</span>
+                      </button>
+                    </td>
                     {/* ACTIONS */}
                     <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
                       <div className="relative dropdown-container">
@@ -1157,10 +1249,10 @@ const PostExOrders = () => {
                               <button
                                 onClick={() => handleView(order.trackingNumber)}
                                 className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2 transition-colors"
-                        >
-                          <Eye className="w-4 h-4" />
+                              >
+                                <Eye className="w-4 h-4" />
                                 View Detail
-                        </button>
+                              </button>
                               {isUnbookedStatus(order.status) ? (
                                 <button
                                   onClick={() => handleCancelOrder(order)}
@@ -1577,7 +1669,7 @@ const PostExOrders = () => {
                   Cancel
                 </button>
                 <button
-                  onClick={handleConfirmCancel}
+                  onClick={handleConfirmCancel(orderToCancel.trackingNumber)}
                   className="px-6 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors font-medium"
                 >
                   Confirm
